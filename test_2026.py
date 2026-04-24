@@ -66,25 +66,15 @@ def fetch_feed() -> list[dict]:
     return videos
 
 
-def fetch_video_detail(video_id: str) -> dict:
-    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-
+def fetch_transcript(video: dict) -> dict:
     content = ""
     try:
-        entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["ko"])
+        entries = YouTubeTranscriptApi.get_transcript(video["id"], languages=["ko"])
         content = _format_transcript(entries)
     except Exception:
-        content = info.get("description", "") or ""
+        content = ""
 
-    return {
-        "id": video_id,
-        "title": info.get("title", ""),
-        "link": f"https://www.youtube.com/watch?v={video_id}",
-        "published": _date_to_iso(info.get("upload_date", "")),
-        "content": content[:15000],
-    }
+    return {**video, "content": content[:15000]}
 
 
 def summarize(video: dict) -> str:
@@ -180,8 +170,8 @@ def main() -> None:
         time.sleep(1)
 
         for video in month_videos:
-            print(f"  상세 정보 가져오는 중: {video['title']}")
-            detailed = fetch_video_detail(video["id"])
+            print(f"  자막 가져오는 중: {video['title']}")
+            detailed = fetch_transcript(video)
             print(f"  자막 {len(detailed['content'])}자")
             summary = summarize(detailed)
             send_discord(detailed, summary)

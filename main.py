@@ -17,7 +17,7 @@ _CJK_RE = re.compile(
     r'[぀-ヿ'   # 히라가나 + 가타카나
     r'㐀-䶿'    # CJK 확장 A
     r'一-鿿'    # CJK 통합 한자
-    r'豈-﫿]'   # CJK 호환 한자
+    r'豈-﫿]'   # CJK 호환 한자
 )
 
 
@@ -32,7 +32,6 @@ def _date_to_iso(upload_date: str) -> str:
 
 
 def _format_transcript(entries: list) -> str:
-    """자막을 30초 단위로 묶어 타임스탬프와 함께 반환."""
     groups: dict[int, list[str]] = {}
     for t in entries:
         bucket = int(t["start"] // 30) * 30
@@ -76,25 +75,16 @@ def fetch_feed() -> list[dict]:
     return videos
 
 
-def fetch_video_detail(video_id: str) -> dict:
-    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-
+def fetch_transcript(video: dict) -> dict:
+    """자막만 추가해서 반환. yt_dlp 개별 영상 호출 없음."""
     content = ""
     try:
-        entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["ko"])
+        entries = YouTubeTranscriptApi.get_transcript(video["id"], languages=["ko"])
         content = _format_transcript(entries)
     except Exception:
-        content = info.get("description", "") or ""
+        content = ""
 
-    return {
-        "id": video_id,
-        "title": info.get("title", ""),
-        "link": f"https://www.youtube.com/watch?v={video_id}",
-        "published": _date_to_iso(info.get("upload_date", "")),
-        "content": content[:15000],
-    }
+    return {**video, "content": content[:15000]}
 
 
 def summarize(video: dict) -> str:
@@ -142,7 +132,6 @@ def send_discord(video: dict, summary: str) -> None:
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
     published_dt = datetime.fromisoformat(video["published"])
 
-    # Discord embed description 한도 4096자
     if len(summary) > 4000:
         summary = summary[:4000] + "\n…(이하 생략)"
 
@@ -173,7 +162,7 @@ def main() -> None:
 
     for video in reversed(new_videos):
         print(f"처리 중: {video['title']}")
-        detailed = fetch_video_detail(video["id"])
+        detailed = fetch_transcript(video)
         print(f"  자막 {len(detailed['content'])}자")
         summary = summarize(detailed)
         send_discord(detailed, summary)
