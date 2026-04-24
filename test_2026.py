@@ -35,8 +35,11 @@ def _date_to_iso(upload_date: str) -> str:
 def _format_transcript(entries: list) -> str:
     groups: dict[int, list[str]] = {}
     for t in entries:
+        text = t["text"].strip()
+        if len(text) < 4:
+            continue
         bucket = int(t["start"] // 30) * 30
-        groups.setdefault(bucket, []).append(t["text"])
+        groups.setdefault(bucket, []).append(text)
 
     lines = []
     for sec in sorted(groups):
@@ -49,14 +52,31 @@ def fetch_feed() -> list[dict]:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": True,
+        "skip_download": True,
         "playlistend": 15,
+        "extract_flat": False,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(CHANNEL_URL, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(CHANNEL_URL, download=False)
+        entries = info.get("entries") or []
+        print(f"full 추출 성공 ({len(entries)}개)")
+    except Exception as e:
+        print(f"full 추출 실패 ({e}), flat으로 재시도...")
+        flat_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "playlistend": 15,
+        }
+        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+            info = ydl.extract_info(CHANNEL_URL, download=False)
+        entries = info.get("entries") or []
 
     videos = []
-    for entry in (info.get("entries") or []):
+    for entry in entries:
+        if not entry:
+            continue
         videos.append({
             "id": entry["id"],
             "title": entry.get("title", ""),
@@ -68,11 +88,9 @@ def fetch_feed() -> list[dict]:
 
 
 def fetch_transcript(video: dict) -> dict:
-    content = ""
-    video_id = video["id"]
-
+    transcript_text = ""
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video["id"])
 
         transcript = None
         for lang in (["ko", "ko-KR"], ["a.ko"]):
@@ -85,15 +103,20 @@ def fetch_transcript(video: dict) -> dict:
             transcript = next(iter(transcript_list))
 
         entries = transcript.fetch()
-        content = _format_transcript(entries)
-        print(f"  자막 {len(content)}자 ({transcript.language_code})")
+        transcript_text = _format_transcript(entries)
+        print(f"  자막 {len(transcript_text)}자 ({transcript.language_code})")
 
     except Exception as e:
-        print(f"  자막 실패: {type(e).__name__}: {e}")
-        content = video.get("description", "")
-        if content:
-            print(f"  description fallback {len(content)}자")
+        print(f"  자막 없음: {type(e).__name__}")
 
+    parts = []
+    if video.get("description", "").strip():
+        parts.append("【영상 설명】\n" + video["description"].strip())
+    if transcript_text.strip():
+        parts.append("【자막】\n" + transcript_text.strip())
+
+    content = "\n\n".join(parts)
+    print(f"  최종 콘텐츠 {len(content)}자")
     return {**video, "content": content[:15000]}
 
 
@@ -105,19 +128,19 @@ def summarize(video: dict) -> str:
     if has_content:
         prompt = (
             "너는 메이플스토리 뉴스 요약 봇이야.\n"
-            "아래 자막을 읽고, 주제가 바뀌는 지점마다 타임라인 항목을 만들어.\n\n"
+            "아래 영상 정보를 읽고, 주제가 바뀌는 지점마다 타임라인 항목을 만들어.\n\n"
             "【출력 형식】\n"
-            "▶ MM:SS 주제 제목\n"
+            "▶ MM:SS 주제 제목  (자막 없으면 ▶ 주제 제목)\n"
             "  • 세부 내용 (날짜·아이템명·수량·수치 등 구체적으로)\n"
             "  • ...\n\n"
             "【규칙】\n"
             "- 한글만 사용. 한자·일본어·중국어 절대 금지\n"
             "- 날짜는 'X월 X일' 형식으로 정확히\n"
             "- 보상 아이템·수량 반드시 포함\n"
-            "- 자막에 없는 내용 작성 금지\n"
+            "- 정보 출처에 없는 내용 작성 금지\n"
             "- '있습니다/진행됩니다' 같은 추상 표현 금지\n\n"
             f"제목: {video['title']}\n\n"
-            f"자막:\n{video['content']}\n"
+            f"{video['content']}\n"
         )
     else:
         prompt = (
