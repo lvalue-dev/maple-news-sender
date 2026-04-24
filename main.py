@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import requests
 import yt_dlp
 from groq import Groq
+from youtube_transcript_api import YouTubeTranscriptApi
 
 CHANNEL_URL = "https://www.youtube.com/channel/UC1dHu9GhbHH7RcHKyJdaOvA/videos"
 SEEN_FILE = Path("seen_videos.json")
@@ -16,6 +18,11 @@ def _date_to_iso(upload_date: str) -> str:
     if not upload_date or len(upload_date) < 8:
         return datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
     return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}T00:00:00+00:00"
+
+
+def _strip_cjk(text: str) -> str:
+    """한자·중국어 문자를 제거 (한글·ASCII는 유지)."""
+    return re.sub(r'[一-鿿㐀-䶿]', '', text)
 
 
 def load_seen() -> set:
@@ -29,7 +36,6 @@ def save_seen(seen: set) -> None:
 
 
 def fetch_feed() -> list[dict]:
-    """최근 15개 영상 ID·제목만 빠르게 가져옴 (신규 여부 판단용)."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -51,16 +57,25 @@ def fetch_feed() -> list[dict]:
 
 
 def fetch_video_detail(video_id: str) -> dict:
-    """단일 영상의 전체 설명(description) 포함 상세 정보를 가져옴."""
+    # 메타데이터 (제목, 날짜)
     ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+
+    # 자막 (없으면 description fallback)
+    transcript = ""
+    try:
+        entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["ko"])
+        transcript = " ".join(t["text"] for t in entries)
+    except Exception:
+        transcript = info.get("description", "") or ""
+
     return {
         "id": video_id,
         "title": info.get("title", ""),
         "link": f"https://www.youtube.com/watch?v={video_id}",
         "published": _date_to_iso(info.get("upload_date", "")),
-        "description": info.get("description", "") or "",
+        "content": transcript[:6000],  # Groq 토큰 절약
     }
 
 
@@ -69,15 +84,16 @@ def summarize(video: dict) -> str:
 
     prompt = (
         "당신은 메이플스토리 게임 뉴스 요약 봇입니다.\n"
-        "아래 YouTube 영상 정보를 바탕으로 핵심 내용을 한국어로 요약해주세요.\n\n"
+        "아래 영상 내용을 바탕으로 한국어로 핵심만 요약하세요.\n\n"
         "[필수 규칙]\n"
-        "- 반드시 한국어(한글)만 사용. 한자·중국어·일본어 문자 절대 금지\n"
-        "- 이벤트 영상: 이벤트명, 보상, 참여 방법 등 구체적인 내용 포함\n"
-        "- 공략 영상: 핵심 전략, 주의사항, 추천 세팅 등 구체적인 내용 포함\n"
-        "- 업데이트 영상: 변경·추가된 항목을 구체적으로 나열\n"
-        "- 인사말·부연설명 없이 요약 내용만 출력 (5~8줄)\n\n"
-        f"제목: {video['title']}\n"
-        f"설명:\n{video['description'] or '(설명 없음)'}\n"
+        "- 한국어(한글)만 사용. 한자·중국어 절대 금지, 한자가 있으면 한글로 바꿔서 출력\n"
+        "- 이벤트: 이벤트명, 일정(시작~종료), 보상 종류와 수량, 참여 방법을 구체적으로\n"
+        "- 공략: 보스명, 핵심 패턴 대처법, 추천 세팅, 주의사항을 구체적으로\n"
+        "- 업데이트/패치: 변경·추가된 항목을 하나씩 구체적으로 나열\n"
+        "- '이벤트가 있습니다' 같은 추상적 표현 금지. 실제 내용을 서술할 것\n"
+        "- 인사말 없이 요약만 출력 (6~10줄)\n\n"
+        f"제목: {video['title']}\n\n"
+        f"내용:\n{video['content'] or '(내용 없음)'}\n"
     )
 
     for attempt in range(3):
@@ -86,7 +102,8 @@ def summarize(video: dict) -> str:
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
             )
-            return response.choices[0].message.content.strip()
+            result = response.choices[0].message.content.strip()
+            return _strip_cjk(result)
         except Exception as e:
             if "429" in str(e) or "rate_limit" in str(e).lower():
                 wait = 30 * (attempt + 1)
@@ -99,16 +116,14 @@ def summarize(video: dict) -> str:
 
 def send_discord(video: dict, summary: str) -> None:
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
-
     published_dt = datetime.fromisoformat(video["published"])
-    published_str = published_dt.strftime("%Y-%m-%d")
 
     embed = {
         "title": video["title"],
         "url": video["link"],
         "description": summary,
         "color": 0xA020F0,
-        "footer": {"text": f"업로드: {published_str}"},
+        "footer": {"text": f"업로드: {published_dt.strftime('%Y-%m-%d')}"},
         "thumbnail": {
             "url": f"https://img.youtube.com/vi/{video['id']}/hqdefault.jpg"
         },
