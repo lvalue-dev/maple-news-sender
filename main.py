@@ -13,7 +13,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 CHANNEL_URL = "https://www.youtube.com/channel/UC1dHu9GhbHH7RcHKyJdaOvA/videos"
 SEEN_FILE = Path("seen_videos.json")
 
-# 히라가나/가타카나/한자 유니코드 범위 (한글 AC00-D7AF는 포함 안 됨)
 _CJK_RE = re.compile(
     r'[぀-ヿ'   # 히라가나 + 가타카나
     r'㐀-䶿'    # CJK 확장 A
@@ -30,6 +29,20 @@ def _date_to_iso(upload_date: str) -> str:
     if not upload_date or len(upload_date) < 8:
         return datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
     return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}T00:00:00+00:00"
+
+
+def _format_transcript(entries: list) -> str:
+    """자막을 30초 단위로 묶어 타임스탬프와 함께 반환."""
+    groups: dict[int, list[str]] = {}
+    for t in entries:
+        bucket = int(t["start"] // 30) * 30
+        groups.setdefault(bucket, []).append(t["text"])
+
+    lines = []
+    for sec in sorted(groups):
+        m, s = divmod(sec, 60)
+        lines.append(f"[{m:02d}:{s:02d}] {' '.join(groups[sec])}")
+    return "\n".join(lines)
 
 
 def load_seen() -> set:
@@ -68,19 +81,19 @@ def fetch_video_detail(video_id: str) -> dict:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
 
-    transcript = ""
+    content = ""
     try:
         entries = YouTubeTranscriptApi.get_transcript(video_id, languages=["ko"])
-        transcript = " ".join(t["text"] for t in entries)
+        content = _format_transcript(entries)
     except Exception:
-        transcript = info.get("description", "") or ""
+        content = info.get("description", "") or ""
 
     return {
         "id": video_id,
         "title": info.get("title", ""),
         "link": f"https://www.youtube.com/watch?v={video_id}",
         "published": _date_to_iso(info.get("upload_date", "")),
-        "content": transcript[:10000],
+        "content": content[:15000],
     }
 
 
@@ -88,20 +101,21 @@ def summarize(video: dict) -> str:
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
     prompt = (
-        "너는 메이플스토리 뉴스 요약 봇이야. 아래 영상 자막을 읽고 항목별로 한국어로 작성해.\n\n"
-        "【출력 형식 - 반드시 이 형식 그대로】\n"
-        "**유형**: 이벤트공략 / 업데이트 / 보스공략 / 기타 중 하나\n"
-        "**핵심 요약**: (한 줄)\n"
-        "**주요 내용**:\n"
-        "- (구체적 항목. 날짜·수량·아이템명 등 숫자와 고유명사 반드시 포함)\n"
-        "- ...\n"
-        "**이벤트 기간**: (예: 4월 24일 ~ 5월 14일 / 언급 없으면 '언급 없음')\n"
-        "**보상**: (구체적 아이템명과 수량 / 없으면 '언급 없음')\n"
-        "**주의사항**: (있으면 기재 / 없으면 생략)\n\n"
+        "너는 메이플스토리 뉴스 요약 봇이야.\n"
+        "아래 타임스탬프가 포함된 자막을 읽고, 주제가 바뀌는 지점마다 타임라인 항목을 만들어.\n\n"
+        "【출력 형식】\n"
+        "▶ MM:SS 주제 제목\n"
+        "  • 세부 내용 (날짜·아이템명·수량·수치 등 구체적으로)\n"
+        "  • 세부 내용\n"
+        "\n"
+        "▶ MM:SS 주제 제목\n"
+        "  • ...\n\n"
         "【규칙】\n"
-        "- 한글만 사용. 한자·일본어·중국어 문자 절대 금지\n"
-        "- '있습니다', '진행됩니다' 같은 추상 표현 금지. 실제 내용 서술\n"
-        "- 자막에 없는 내용은 '언급 없음'\n\n"
+        "- 한글만 사용. 한자·일본어·중국어 절대 금지\n"
+        "- 날짜는 'X월 X일' 형식으로 정확히\n"
+        "- 보상 아이템과 수량은 반드시 포함\n"
+        "- 자막에 없는 내용은 작성 금지\n"
+        "- '있습니다/진행됩니다' 같은 추상 표현 금지\n\n"
         f"제목: {video['title']}\n\n"
         f"자막:\n{video['content'] or '(자막 없음)'}\n"
     )
@@ -127,6 +141,10 @@ def summarize(video: dict) -> str:
 def send_discord(video: dict, summary: str) -> None:
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
     published_dt = datetime.fromisoformat(video["published"])
+
+    # Discord embed description 한도 4096자
+    if len(summary) > 4000:
+        summary = summary[:4000] + "\n…(이하 생략)"
 
     embed = {
         "title": video["title"],
@@ -156,6 +174,7 @@ def main() -> None:
     for video in reversed(new_videos):
         print(f"처리 중: {video['title']}")
         detailed = fetch_video_detail(video["id"])
+        print(f"  자막 {len(detailed['content'])}자")
         summary = summarize(detailed)
         send_discord(detailed, summary)
         seen.add(video["id"])
