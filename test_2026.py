@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import datetime
 
 import requests
-import google.generativeai as genai
+from google import genai
 
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UC1dHu9GhbHH7RcHKyJdaOvA"
 NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
@@ -43,8 +43,7 @@ def fetch_feed() -> list[dict]:
 
 
 def summarize(video: dict) -> str:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     prompt = (
         "당신은 메이플스토리 게임 뉴스 요약 봇입니다.\n"
@@ -54,8 +53,21 @@ def summarize(video: dict) -> str:
         f"설명:\n{video['description'] or '(설명 없음)'}\n"
     )
 
-    response = model.generate_content(prompt)
-    return response.text.strip()
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+            )
+            return response.text.strip()
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 30 * (attempt + 1)
+                print(f"  Rate limit, {wait}초 대기 후 재시도...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Gemini API 재시도 초과")
 
 
 def send_month_header(month: int, count: int) -> None:
@@ -110,14 +122,14 @@ def main() -> None:
         print(f"\n[2026년 {MONTH_KR[month]}] {len(month_videos)}개")
 
         send_month_header(month, len(month_videos))
-        time.sleep(0.5)  # Discord rate limit 여유
+        time.sleep(1)
 
         for video in month_videos:
             print(f"  요약 중: {video['title']}")
             summary = summarize(video)
             send_discord(video, summary)
             print(f"  전송 완료")
-            time.sleep(0.5)
+            time.sleep(1)
 
     print("\n모든 전송 완료!")
 

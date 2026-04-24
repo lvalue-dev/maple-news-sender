@@ -1,12 +1,12 @@
 import os
 import json
-import hashlib
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
 import requests
-import google.generativeai as genai
+from google import genai
 
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UC1dHu9GhbHH7RcHKyJdaOvA"
 SEEN_FILE = Path("seen_videos.json")
@@ -52,9 +52,7 @@ def fetch_feed() -> list[dict]:
 
 
 def summarize(video: dict) -> str:
-    api_key = os.environ["GEMINI_API_KEY"]
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     prompt = (
         "당신은 메이플스토리 게임 뉴스 요약 봇입니다.\n"
@@ -64,8 +62,21 @@ def summarize(video: dict) -> str:
         f"설명:\n{video['description'] or '(설명 없음)'}\n"
     )
 
-    response = model.generate_content(prompt)
-    return response.text.strip()
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+            )
+            return response.text.strip()
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 30 * (attempt + 1)
+                print(f"  Rate limit, {wait}초 대기 후 재시도...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Gemini API 재시도 초과")
 
 
 def send_discord(video: dict, summary: str) -> None:
@@ -100,7 +111,6 @@ def main() -> None:
         print("새 영상 없음")
         return
 
-    # 오래된 순서부터 처리
     for video in reversed(new_videos):
         print(f"처리 중: {video['title']}")
         summary = summarize(video)
