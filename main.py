@@ -35,7 +35,7 @@ def _format_transcript(entries: list) -> str:
     groups: dict[int, list[str]] = {}
     for t in entries:
         text = t["text"].strip()
-        if len(text) < 4:   # 숫자 단편 등 노이즈 제거
+        if len(text) < 4:
             continue
         bucket = int(t["start"] // 30) * 30
         groups.setdefault(bucket, []).append(text)
@@ -45,6 +45,91 @@ def _format_transcript(entries: list) -> str:
         m, s = divmod(sec, 60)
         lines.append(f"[{m:02d}:{s:02d}] {' '.join(groups[sec])}")
     return "\n".join(lines)
+
+
+def _format_chapters(chapters: list) -> str:
+    lines = []
+    for ch in chapters or []:
+        start = int(ch.get("start_time", 0))
+        end = ch.get("end_time")
+        title = ch.get("title", "").strip()
+        if not title or title.startswith("<Untitled"):
+            continue
+        m_s, s_s = divmod(start, 60)
+        suffix = f"~{int(end) // 60:02d}:{int(end) % 60:02d}" if end else ""
+        lines.append(f"[{m_s:02d}:{s_s:02d}{suffix}] {title}")
+    return "\n".join(lines)
+
+
+def _parse_desc_timestamps(description: str) -> str:
+    if not description:
+        return ""
+    ts_re = re.compile(
+        r'^(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)$'
+        r'|^(.+?)\s+(\d{1,2}:\d{2}(?::\d{2})?)$',
+        re.MULTILINE
+    )
+    lines = []
+    for m in ts_re.finditer(description):
+        if m.group(1):
+            ts, title = m.group(1), m.group(2).strip()
+        else:
+            ts, title = m.group(4), m.group(3).strip()
+        if title:
+            lines.append(f"[{ts}] {title}")
+    return "\n".join(lines)
+
+
+def _extract_sub_urls(entry: dict) -> list:
+    subs = entry.get("subtitles") or {}
+    auto = entry.get("automatic_captions") or {}
+    for lang in ("ko", "ko-KR"):
+        if lang in subs:
+            return subs[lang]
+    for lang in ("ko", "a.ko", "a-ko"):
+        if lang in auto:
+            return auto[lang]
+    return []
+
+
+def _parse_vtt(vtt_text: str) -> str:
+    entries = []
+    pattern = re.compile(
+        r'(\d+:\d+:\d+\.\d+|\d+:\d+\.\d+)\s*-->.*\n((?:(?!-->).+\n?)*)',
+        re.MULTILINE
+    )
+    for m in pattern.finditer(vtt_text):
+        ts = m.group(1)
+        parts = ts.split(":")
+        start = (
+            float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+            if len(parts) == 3
+            else float(parts[0]) * 60 + float(parts[1])
+        )
+        text = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        if text and len(text) >= 4:
+            entries.append({"start": start, "text": text})
+    return _format_transcript(entries)
+
+
+def _fetch_subtitle_content(sub_urls: list, cookiefile: str = None) -> str:
+    if not sub_urls:
+        return ""
+    url_entry = next((s for s in sub_urls if s.get("ext") == "vtt"), sub_urls[0])
+    url = url_entry.get("url", "")
+    if not url:
+        return ""
+    ydl_opts = {"quiet": True, "no_warnings": True}
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+    try:
+        from yt_dlp.networking.common import Request
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            data = ydl.urlopen(Request(url)).read().decode("utf-8")
+            return _parse_vtt(data)
+    except Exception as e:
+        print(f"  자막 URL 실패: {type(e).__name__}")
+        return ""
 
 
 def load_seen() -> set:
@@ -58,13 +143,12 @@ def save_seen(seen: set) -> None:
 
 
 def fetch_feed() -> list[dict]:
-    """채널 영상 목록 + description을 full 추출로 가져옴."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "playlistend": 15,
-        "extract_flat": False,   # description 포함 full 추출
+        "extract_flat": False,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -87,43 +171,68 @@ def fetch_feed() -> list[dict]:
     for entry in entries:
         if not entry:
             continue
+        chapters = entry.get("chapters") or []
+        sub_urls = _extract_sub_urls(entry)
+        if chapters:
+            print(f"  [{entry.get('title', '')[:20]}] 챕터 {len(chapters)}개")
+        if sub_urls:
+            print(f"  [{entry.get('title', '')[:20]}] 자막 URL {len(sub_urls)}개")
         videos.append({
             "id": entry["id"],
             "title": entry.get("title", ""),
             "link": f"https://www.youtube.com/watch?v={entry['id']}",
             "published": _date_to_iso(entry.get("upload_date", "")),
             "description": entry.get("description", "") or "",
+            "chapters": chapters,
+            "subtitle_urls": sub_urls,
         })
     return videos
 
 
 def fetch_transcript(video: dict) -> dict:
-    """자막을 추가 소스로 가져와 description과 합침."""
-    transcript_text = ""
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video["id"])
-        transcript = None
-        for lang in (["ko", "ko-KR"], ["a.ko"]):
-            try:
-                transcript = transcript_list.find_transcript(lang)
-                break
-            except Exception:
-                continue
-        if transcript is None:
-            transcript = next(iter(transcript_list))
-
-        entries = transcript.fetch()
-        transcript_text = _format_transcript(entries)
-        print(f"  자막 {len(transcript_text)}자 ({transcript.language_code})")
-    except Exception as e:
-        print(f"  자막 없음: {type(e).__name__}")
-
-    # description + 자막 합치기
     parts = []
+
     if video.get("description", "").strip():
         parts.append("【영상 설명】\n" + video["description"].strip())
-    if transcript_text.strip():
-        parts.append("【자막】\n" + transcript_text.strip())
+
+    # 우선순위 1: yt_dlp 챕터 마커
+    chapters_text = _format_chapters(video.get("chapters", []))
+    if chapters_text:
+        parts.append("【챕터】\n" + chapters_text)
+        print(f"  챕터 {len(video.get('chapters', []))}개 사용")
+    else:
+        # 우선순위 2: 설명 타임스탬프 파싱
+        desc_ts = _parse_desc_timestamps(video.get("description", ""))
+        if desc_ts:
+            parts.append("【설명 타임스탬프】\n" + desc_ts)
+            print(f"  설명 타임스탬프 {len(desc_ts)}자")
+
+    # 우선순위 3: 자막 URL 다운로드 (yt_dlp full 추출에서 얻은 URL)
+    cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
+    sub_text = _fetch_subtitle_content(video.get("subtitle_urls", []), cookiefile)
+    if sub_text:
+        parts.append("【자막】\n" + sub_text)
+        print(f"  자막 URL {len(sub_text)}자")
+    else:
+        # 우선순위 4: youtube_transcript_api fallback
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video["id"])
+            transcript = None
+            for lang in (["ko", "ko-KR"], ["a.ko"]):
+                try:
+                    transcript = transcript_list.find_transcript(lang)
+                    break
+                except Exception:
+                    continue
+            if transcript is None:
+                transcript = next(iter(transcript_list))
+            entries = transcript.fetch()
+            t_text = _format_transcript(entries)
+            if t_text.strip():
+                parts.append("【자막】\n" + t_text.strip())
+                print(f"  자막 API {len(t_text)}자 ({transcript.language_code})")
+        except Exception as e:
+            print(f"  자막 없음: {type(e).__name__}")
 
     content = "\n\n".join(parts)
     print(f"  최종 콘텐츠 {len(content)}자")
@@ -140,7 +249,7 @@ def summarize(video: dict) -> str:
             "너는 메이플스토리 뉴스 요약 봇이야.\n"
             "아래 영상 정보를 읽고, 주제가 바뀌는 지점마다 타임라인 항목을 만들어.\n\n"
             "【출력 형식】\n"
-            "▶ MM:SS 주제 제목  (자막 없으면 ▶ 주제 제목)\n"
+            "▶ MM:SS 주제 제목  (타임스탬프 없으면 ▶ 주제 제목)\n"
             "  • 세부 내용 (날짜·아이템명·수량·수치 등 구체적으로)\n"
             "  • ...\n\n"
             "【규칙】\n"
