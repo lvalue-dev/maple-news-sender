@@ -62,17 +62,37 @@ def fetch_feed() -> list[dict]:
             "title": entry.get("title", ""),
             "link": f"https://www.youtube.com/watch?v={entry['id']}",
             "published": _date_to_iso(entry.get("upload_date", "")),
+            "description": entry.get("description", "") or "",
         })
     return videos
 
 
 def fetch_transcript(video: dict) -> dict:
     content = ""
+    video_id = video["id"]
+
     try:
-        entries = YouTubeTranscriptApi.get_transcript(video["id"], languages=["ko"])
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        transcript = None
+        for lang in (["ko", "ko-KR"], ["a.ko"]):
+            try:
+                transcript = transcript_list.find_transcript(lang)
+                break
+            except Exception:
+                continue
+        if transcript is None:
+            transcript = next(iter(transcript_list))
+
+        entries = transcript.fetch()
         content = _format_transcript(entries)
-    except Exception:
-        content = ""
+        print(f"  자막 {len(content)}자 ({transcript.language_code})")
+
+    except Exception as e:
+        print(f"  자막 실패: {type(e).__name__}: {e}")
+        content = video.get("description", "")
+        if content:
+            print(f"  description fallback {len(content)}자")
 
     return {**video, "content": content[:15000]}
 
@@ -80,25 +100,33 @@ def fetch_transcript(video: dict) -> dict:
 def summarize(video: dict) -> str:
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    prompt = (
-        "너는 메이플스토리 뉴스 요약 봇이야.\n"
-        "아래 타임스탬프가 포함된 자막을 읽고, 주제가 바뀌는 지점마다 타임라인 항목을 만들어.\n\n"
-        "【출력 형식】\n"
-        "▶ MM:SS 주제 제목\n"
-        "  • 세부 내용 (날짜·아이템명·수량·수치 등 구체적으로)\n"
-        "  • 세부 내용\n"
-        "\n"
-        "▶ MM:SS 주제 제목\n"
-        "  • ...\n\n"
-        "【규칙】\n"
-        "- 한글만 사용. 한자·일본어·중국어 절대 금지\n"
-        "- 날짜는 'X월 X일' 형식으로 정확히\n"
-        "- 보상 아이템과 수량은 반드시 포함\n"
-        "- 자막에 없는 내용은 작성 금지\n"
-        "- '있습니다/진행됩니다' 같은 추상 표현 금지\n\n"
-        f"제목: {video['title']}\n\n"
-        f"자막:\n{video['content'] or '(자막 없음)'}\n"
-    )
+    has_content = bool(video.get("content", "").strip())
+
+    if has_content:
+        prompt = (
+            "너는 메이플스토리 뉴스 요약 봇이야.\n"
+            "아래 자막을 읽고, 주제가 바뀌는 지점마다 타임라인 항목을 만들어.\n\n"
+            "【출력 형식】\n"
+            "▶ MM:SS 주제 제목\n"
+            "  • 세부 내용 (날짜·아이템명·수량·수치 등 구체적으로)\n"
+            "  • ...\n\n"
+            "【규칙】\n"
+            "- 한글만 사용. 한자·일본어·중국어 절대 금지\n"
+            "- 날짜는 'X월 X일' 형식으로 정확히\n"
+            "- 보상 아이템·수량 반드시 포함\n"
+            "- 자막에 없는 내용 작성 금지\n"
+            "- '있습니다/진행됩니다' 같은 추상 표현 금지\n\n"
+            f"제목: {video['title']}\n\n"
+            f"자막:\n{video['content']}\n"
+        )
+    else:
+        prompt = (
+            "너는 메이플스토리 뉴스 요약 봇이야.\n"
+            "자막을 구하지 못해 제목만으로 요약해야 해.\n"
+            "제목에서 유추할 수 있는 내용을 한국어로 3~5줄로 작성해.\n"
+            "한글만 사용. 한자·일본어·중국어 절대 금지.\n\n"
+            f"제목: {video['title']}\n"
+        )
 
     for attempt in range(3):
         try:
@@ -170,9 +198,8 @@ def main() -> None:
         time.sleep(1)
 
         for video in month_videos:
-            print(f"  자막 가져오는 중: {video['title']}")
+            print(f"처리 중: {video['title']}")
             detailed = fetch_transcript(video)
-            print(f"  자막 {len(detailed['content'])}자")
             summary = summarize(detailed)
             send_discord(detailed, summary)
             print(f"  전송 완료")
