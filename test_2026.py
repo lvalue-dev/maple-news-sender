@@ -14,14 +14,23 @@ MONTH_KR = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
             7:"7월",8:"8월",9:"9월",10:"10월",11:"11월",12:"12월"}
 
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
 def fetch_feed() -> list[dict]:
     for attempt in range(4):
         try:
-            resp = requests.get(RSS_URL, timeout=15)
+            resp = requests.get(RSS_URL, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             break
         except requests.HTTPError as e:
-            if e.response.status_code >= 500 and attempt < 3:
+            if attempt < 3:
                 wait = 10 * (attempt + 1)
                 print(f"YouTube RSS {e.response.status_code} 에러, {wait}초 후 재시도...")
                 time.sleep(wait)

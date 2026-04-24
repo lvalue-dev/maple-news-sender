@@ -11,6 +11,13 @@ from google import genai
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UC1dHu9GhbHH7RcHKyJdaOvA"
 SEEN_FILE = Path("seen_videos.json")
 NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 
 def load_seen() -> set:
@@ -26,11 +33,11 @@ def save_seen(seen: set) -> None:
 def fetch_feed() -> list[dict]:
     for attempt in range(4):
         try:
-            resp = requests.get(RSS_URL, timeout=15)
+            resp = requests.get(RSS_URL, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             break
         except requests.HTTPError as e:
-            if e.response.status_code >= 500 and attempt < 3:
+            if attempt < 3:
                 wait = 10 * (attempt + 1)
                 print(f"YouTube RSS {e.response.status_code} 에러, {wait}초 후 재시도...")
                 time.sleep(wait)
