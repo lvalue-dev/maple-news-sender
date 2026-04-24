@@ -1,62 +1,42 @@
 import os
 import sys
 import time
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
 
 import requests
+import yt_dlp
 from google import genai
 
-RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UC1dHu9GhbHH7RcHKyJdaOvA"
-NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+CHANNEL_URL = "https://www.youtube.com/channel/UC1dHu9GhbHH7RcHKyJdaOvA/videos"
 MONTH_KR = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
             7:"7월",8:"8월",9:"9월",10:"10월",11:"11월",12:"12월"}
 
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
+def _date_to_iso(upload_date: str) -> str:
+    if not upload_date or len(upload_date) < 8:
+        return "2000-01-01T00:00:00+00:00"
+    return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}T00:00:00+00:00"
 
 
 def fetch_feed() -> list[dict]:
-    for attempt in range(4):
-        try:
-            resp = requests.get(RSS_URL, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            break
-        except requests.HTTPError as e:
-            if attempt < 3:
-                wait = 10 * (attempt + 1)
-                print(f"YouTube RSS {e.response.status_code} 에러, {wait}초 후 재시도...")
-                time.sleep(wait)
-            else:
-                raise
-    root = ET.fromstring(resp.content)
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "playlistend": 15,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(CHANNEL_URL, download=False)
 
     videos = []
-    for entry in root.findall("atom:entry", NS):
-        video_id = entry.find("yt:videoId", NS).text
-        title = entry.find("atom:title", NS).text
-        link = entry.find("atom:link", NS).get("href")
-        published = entry.find("atom:published", NS).text
-        description = ""
-        media_group = entry.find("{http://search.yahoo.com/mrss/}group")
-        if media_group is not None:
-            media_desc = media_group.find("{http://search.yahoo.com/mrss/}description")
-            if media_desc is not None and media_desc.text:
-                description = media_desc.text.strip()
-
+    for entry in (info.get("entries") or []):
         videos.append({
-            "id": video_id,
-            "title": title,
-            "link": link,
-            "published": published,
-            "description": description,
+            "id": entry["id"],
+            "title": entry.get("title", ""),
+            "link": f"https://www.youtube.com/watch?v={entry['id']}",
+            "published": _date_to_iso(entry.get("upload_date", "")),
+            "description": entry.get("description", "") or "",
         })
     return videos
 
@@ -102,32 +82,32 @@ def send_month_header(month: int, count: int) -> None:
 
 def send_discord(video: dict, summary: str) -> None:
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
-    published_dt = datetime.fromisoformat(video["published"].replace("Z", "+00:00"))
+    published_dt = datetime.fromisoformat(video["published"])
 
     embed = {
         "title": video["title"],
         "url": video["link"],
         "description": summary,
         "color": 0xA020F0,
-        "footer": {"text": published_dt.strftime("%Y-%m-%d %H:%M UTC")},
+        "footer": {"text": published_dt.strftime("%Y-%m-%d")},
         "thumbnail": {"url": f"https://img.youtube.com/vi/{video['id']}/hqdefault.jpg"},
     }
     requests.post(webhook_url, json={"embeds": [embed]}, timeout=15).raise_for_status()
 
 
 def main() -> None:
-    print("RSS 피드 가져오는 중...")
+    print("채널 영상 목록 가져오는 중...")
     videos = fetch_feed()
 
     videos_2026 = []
     for v in videos:
-        dt = datetime.fromisoformat(v["published"].replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(v["published"])
         if dt.year == 2026:
             v["month"] = dt.month
             videos_2026.append(v)
 
     if not videos_2026:
-        print("RSS 피드에 2026년 영상이 없습니다. (RSS는 최신 15개만 제공)")
+        print("2026년 영상이 없습니다.")
         sys.exit(0)
 
     by_month: dict[int, list] = defaultdict(list)
