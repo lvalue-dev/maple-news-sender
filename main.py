@@ -14,7 +14,7 @@ SEEN_FILE = Path("seen_videos.json")
 
 def _date_to_iso(upload_date: str) -> str:
     if not upload_date or len(upload_date) < 8:
-        return "2000-01-01T00:00:00+00:00"
+        return datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
     return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}T00:00:00+00:00"
 
 

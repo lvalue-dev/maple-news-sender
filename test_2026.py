@@ -15,7 +15,7 @@ MONTH_KR = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
 
 def _date_to_iso(upload_date: str) -> str:
     if not upload_date or len(upload_date) < 8:
-        return "2000-01-01T00:00:00+00:00"
+        return datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
     return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}T00:00:00+00:00"
 
 
@@ -99,26 +99,22 @@ def main() -> None:
     print("채널 영상 목록 가져오는 중...")
     videos = fetch_feed()
 
-    videos_2026 = []
+    if not videos:
+        print("영상을 가져오지 못했습니다.")
+        sys.exit(1)
+
+    print(f"총 {len(videos)}개 영상 발견")
     for v in videos:
+        print(f"  [{v['published'][:10]}] {v['title']}")
+
+    by_month: dict[tuple, list] = defaultdict(list)
+    for v in sorted(videos, key=lambda x: x["published"]):
         dt = datetime.fromisoformat(v["published"])
-        if dt.year == 2026:
-            v["month"] = dt.month
-            videos_2026.append(v)
+        by_month[(dt.year, dt.month)].append(v)
 
-    if not videos_2026:
-        print("2026년 영상이 없습니다.")
-        sys.exit(0)
-
-    by_month: dict[int, list] = defaultdict(list)
-    for v in sorted(videos_2026, key=lambda x: x["published"]):
-        by_month[v["month"]].append(v)
-
-    print(f"2026년 영상 {len(videos_2026)}개 발견 ({len(by_month)}개월치)")
-
-    for month in sorted(by_month.keys()):
-        month_videos = by_month[month]
-        print(f"\n[2026년 {MONTH_KR[month]}] {len(month_videos)}개")
+    for (year, month) in sorted(by_month.keys()):
+        month_videos = by_month[(year, month)]
+        print(f"\n[{year}년 {MONTH_KR[month]}] {len(month_videos)}개")
 
         send_month_header(month, len(month_videos))
         time.sleep(1)
