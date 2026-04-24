@@ -6,7 +6,7 @@ from datetime import datetime
 
 import requests
 import yt_dlp
-from google import genai
+from groq import Groq
 
 CHANNEL_URL = "https://www.youtube.com/channel/UC1dHu9GhbHH7RcHKyJdaOvA/videos"
 MONTH_KR = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
@@ -42,7 +42,7 @@ def fetch_feed() -> list[dict]:
 
 
 def summarize(video: dict) -> str:
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
     prompt = (
         "당신은 메이플스토리 게임 뉴스 요약 봇입니다.\n"
@@ -54,19 +54,19 @@ def summarize(video: dict) -> str:
 
     for attempt in range(3):
         try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
             )
-            return response.text.strip()
+            return response.choices[0].message.content.strip()
         except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            if "429" in str(e) or "rate_limit" in str(e).lower():
                 wait = 30 * (attempt + 1)
                 print(f"  Rate limit, {wait}초 대기 후 재시도...")
                 time.sleep(wait)
             else:
                 raise
-    raise RuntimeError("Gemini API 재시도 초과")
+    raise RuntimeError("Groq API 재시도 초과")
 
 
 def send_month_header(month: int, count: int) -> None:
