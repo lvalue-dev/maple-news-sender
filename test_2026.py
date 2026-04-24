@@ -36,9 +36,21 @@ def fetch_feed() -> list[dict]:
             "title": entry.get("title", ""),
             "link": f"https://www.youtube.com/watch?v={entry['id']}",
             "published": _date_to_iso(entry.get("upload_date", "")),
-            "description": entry.get("description", "") or "",
         })
     return videos
+
+
+def fetch_video_detail(video_id: str) -> dict:
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    return {
+        "id": video_id,
+        "title": info.get("title", ""),
+        "link": f"https://www.youtube.com/watch?v={video_id}",
+        "published": _date_to_iso(info.get("upload_date", "")),
+        "description": info.get("description", "") or "",
+    }
 
 
 def summarize(video: dict) -> str:
@@ -46,8 +58,13 @@ def summarize(video: dict) -> str:
 
     prompt = (
         "당신은 메이플스토리 게임 뉴스 요약 봇입니다.\n"
-        "아래 YouTube 영상 정보를 바탕으로 핵심 내용을 한국어로 3~5줄 이내로 간결하게 요약해주세요.\n"
-        "불필요한 인사말, 추가 설명 없이 요약 내용만 출력하세요.\n\n"
+        "아래 YouTube 영상 정보를 바탕으로 핵심 내용을 한국어로 요약해주세요.\n\n"
+        "[필수 규칙]\n"
+        "- 반드시 한국어(한글)만 사용. 한자·중국어·일본어 문자 절대 금지\n"
+        "- 이벤트 영상: 이벤트명, 보상, 참여 방법 등 구체적인 내용 포함\n"
+        "- 공략 영상: 핵심 전략, 주의사항, 추천 세팅 등 구체적인 내용 포함\n"
+        "- 업데이트 영상: 변경·추가된 항목을 구체적으로 나열\n"
+        "- 인사말·부연설명 없이 요약 내용만 출력 (5~8줄)\n\n"
         f"제목: {video['title']}\n"
         f"설명:\n{video['description'] or '(설명 없음)'}\n"
     )
@@ -104,8 +121,6 @@ def main() -> None:
         sys.exit(1)
 
     print(f"총 {len(videos)}개 영상 발견")
-    for v in videos:
-        print(f"  [{v['published'][:10]}] {v['title']}")
 
     by_month: dict[tuple, list] = defaultdict(list)
     for v in sorted(videos, key=lambda x: x["published"]):
@@ -120,9 +135,11 @@ def main() -> None:
         time.sleep(1)
 
         for video in month_videos:
-            print(f"  요약 중: {video['title']}")
-            summary = summarize(video)
-            send_discord(video, summary)
+            print(f"  상세 정보 가져오는 중: {video['title']}")
+            detailed = fetch_video_detail(video["id"])
+            print(f"  요약 중...")
+            summary = summarize(detailed)
+            send_discord(detailed, summary)
             print(f"  전송 완료")
             time.sleep(1)
 
