@@ -24,8 +24,18 @@ def save_seen(seen: set) -> None:
 
 
 def fetch_feed() -> list[dict]:
-    resp = requests.get(RSS_URL, timeout=15)
-    resp.raise_for_status()
+    for attempt in range(4):
+        try:
+            resp = requests.get(RSS_URL, timeout=15)
+            resp.raise_for_status()
+            break
+        except requests.HTTPError as e:
+            if e.response.status_code >= 500 and attempt < 3:
+                wait = 10 * (attempt + 1)
+                print(f"YouTube RSS {e.response.status_code} 에러, {wait}초 후 재시도...")
+                time.sleep(wait)
+            else:
+                raise
     root = ET.fromstring(resp.content)
 
     videos = []
