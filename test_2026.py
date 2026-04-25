@@ -1,3 +1,4 @@
+import http.cookiejar
 import io
 import math
 import os
@@ -20,10 +21,10 @@ MONTH_KR = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
             7:"7월",8:"8월",9:"9월",10:"10월",11:"11월",12:"12월"}
 
 _CJK_RE = re.compile(
-    r'[぀-ヿ'   # 히라가나 + 가타카나
-    r'㐀-䶿'    # CJK 확장 A
-    r'一-鿿'    # CJK 통합 한자
-    r'豈-﫿]'   # CJK 호환 한자
+    r'[぀-ヿ'
+    r'㐀-䶿'
+    r'一-鿿'
+    r'豈-﫿]'
 )
 _URL_RE = re.compile(r'https?://\S+|www\.\S+')
 
@@ -59,7 +60,6 @@ def _format_transcript(entries: list) -> str:
             continue
         bucket = int(t["start"] // 30) * 30
         groups.setdefault(bucket, []).append(text)
-
     lines = []
     for sec in sorted(groups):
         m, s = divmod(sec, 60)
@@ -153,7 +153,6 @@ def _fetch_subtitle_content(sub_urls: list, cookiefile: str = None) -> str:
 
 
 def _fetch_manual_transcript(video_id: str) -> str:
-    """수동 업로드 자막만 가져온다. ASR(자동생성)은 무시."""
     try:
         transcript_list = YouTubeTranscriptApi().list(video_id)
         transcript = transcript_list.find_manually_created_transcript(["ko", "ko-KR"])
@@ -163,40 +162,78 @@ def _fetch_manual_transcript(video_id: str) -> str:
             print(f"  수동 자막 {len(text)}자")
             return text
     except NoTranscriptFound:
-        print("  수동 자막 없음 (ASR만 존재 → 건너뜀)")
+        print("  수동 자막 없음 (ASR만 존재 -> 건너뜀)")
     except Exception as e:
         print(f"  자막 API 실패: {type(e).__name__}: {e}")
     return ""
 
 
-def _scrape_video_info(video_id: str) -> dict:
-    """YouTube 페이지에서 영상 설명 + 스토리보드 spec 추출."""
+def _scrape_video_info(video_id: str, cookiefile: str = None) -> dict:
+    session = requests.Session()
+    if cookiefile and os.path.exists(cookiefile):
+        jar = http.cookiejar.MozillaCookieJar()
+        try:
+            jar.load(cookiefile, ignore_discard=True, ignore_expires=True)
+            session.cookies = jar
+            print(f"  쿠키 {sum(1 for _ in jar)}개 적용")
+        except Exception as e:
+            print(f"  쿠키 로드 실패: {e}")
     try:
-        resp = requests.get(
+        resp = session.get(
             f"https://www.youtube.com/watch?v={video_id}",
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "ko-KR,ko;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Upgrade-Insecure-Requests": "1",
             },
             timeout=15,
         )
         match = re.search(r'ytInitialPlayerResponse\s*=\s*', resp.text)
         if match:
             data, _ = json.JSONDecoder().raw_decode(resp.text, match.end())
+            play_status = data.get("playabilityStatus", {}).get("status", "")
             desc = data.get("videoDetails", {}).get("shortDescription", "")
             spec = (data.get("storyboards", {})
                         .get("playerStoryboardSpecRenderer", {})
                         .get("spec", ""))
-            print(f"  페이지 스크래핑 desc={len(desc)}자 spec={'있음' if spec else '없음'}")
-            return {"description": desc, "storyboard_spec": spec}
+            print(f"  페이지 스크래핑 status={play_status} desc={len(desc)}자 spec={'있음' if spec else '없음'}")
+            if play_status == "OK":
+                return {"description": desc, "storyboard_spec": spec}
+            else:
+                print(f"  -> 접근 제한 (쿠키 필요 또는 만료)")
         else:
-            status_hint = ""
-            if resp.status_code != 200:
-                status_hint = f" (HTTP {resp.status_code})"
-            print(f"  페이지 스크래핑: ytInitialPlayerResponse 없음{status_hint}")
+            print(f"  페이지 스크래핑: ytInitialPlayerResponse 없음 (HTTP {resp.status_code})")
     except Exception as e:
         print(f"  페이지 스크래핑 실패: {type(e).__name__}: {e}")
     return {"description": "", "storyboard_spec": ""}
+
+
+def _fetch_video_details_ytdlp(video_id: str, cookiefile: str) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "cookiefile": cookiefile,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=False,
+            )
+        desc = info.get("description", "") or ""
+        chapters = info.get("chapters") or []
+        sub_urls = _extract_sub_urls(info)
+        print(f"  yt-dlp 개별 추출 desc={len(desc)}자 chapters={len(chapters)} subs={len(sub_urls)}")
+        return {"description": desc, "chapters": chapters, "subtitle_urls": sub_urls}
+    except Exception as e:
+        print(f"  yt-dlp 개별 추출 실패: {type(e).__name__}: {e}")
+        return {}
 
 
 def _parse_storyboard(spec: str) -> list[dict]:
@@ -258,7 +295,6 @@ def _ocr_storyboard(spec: str, reader) -> str:
     levels = _parse_storyboard(spec)
     if not levels:
         return ""
-
     best = next((l for l in levels if l["width"] >= 240), None)
     if not best:
         return ""
@@ -266,7 +302,6 @@ def _ocr_storyboard(spec: str, reader) -> str:
     interval_sec = best["interval_ms"] / 1000
     cols, rows = best["cols"], best["rows"]
     frame_w, frame_h = best["width"], best["height"]
-
     seen_texts: set[str] = set()
     results: list[tuple[float, str]] = []
     frame_global_idx = 0
@@ -284,7 +319,6 @@ def _ocr_storyboard(spec: str, reader) -> str:
             for c in range(cols):
                 if frame_global_idx >= best["count"]:
                     break
-
                 timestamp = frame_global_idx * interval_sec
                 frame = sheet.crop((
                     c * frame_w, r * frame_h,
@@ -292,18 +326,15 @@ def _ocr_storyboard(spec: str, reader) -> str:
                 ))
                 frame = frame.resize((frame_w * 4, frame_h * 4), Image.LANCZOS)
                 frame = ImageEnhance.Contrast(frame).enhance(1.5)
-
                 text = _run_easyocr(frame, reader)
                 if text and text not in seen_texts:
                     seen_texts.add(text)
                     m, s = divmod(int(timestamp), 60)
                     results.append((timestamp, f"[{m:02d}:{s:02d}] {text}"))
-
                 frame_global_idx += 1
 
     if not results:
         return ""
-
     results.sort(key=lambda x: x[0])
     print(f"  스토리보드 OCR {len(results)}개 블록")
     return "\n".join(t for _, t in results)
@@ -316,16 +347,13 @@ def _ocr_all(video_id: str, storyboard_spec: str) -> str:
     except Exception as e:
         print(f"  EasyOCR 초기화 실패: {e}")
         return ""
-
     thumb_text = _ocr_thumbnail(video_id, reader)
     sb_text = _ocr_storyboard(storyboard_spec, reader)
-
     parts = []
     if thumb_text:
         parts.append(f"[썸네일] {thumb_text}")
     if sb_text:
         parts.append(sb_text)
-
     return "\n".join(parts)
 
 
@@ -376,47 +404,54 @@ def fetch_feed() -> list[dict]:
 
 
 def fetch_transcript(video: dict) -> dict:
+    cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
     parts = []
 
     desc = video.get("description", "").strip()
     storyboard_spec = video.get("storyboard_spec", "")
+    chapters = list(video.get("chapters") or [])
+    sub_urls = list(video.get("subtitle_urls") or [])
 
     if len(desc) < 100 or not storyboard_spec:
-        info = _scrape_video_info(video["id"])
+        info = _scrape_video_info(video["id"], cookiefile)
         if len(info.get("description", "")) > len(desc):
             desc = info["description"]
         if not storyboard_spec:
             storyboard_spec = info.get("storyboard_spec", "")
 
+    if len(desc) < 100 and cookiefile:
+        detail = _fetch_video_details_ytdlp(video["id"], cookiefile)
+        if detail:
+            if len(detail.get("description", "")) > len(desc):
+                desc = detail["description"]
+            if not chapters:
+                chapters = detail.get("chapters", [])
+            if not sub_urls:
+                sub_urls = detail.get("subtitle_urls", [])
+
     cleaned_desc = _clean_text(desc)
     if cleaned_desc:
         parts.append("【영상 설명】\n" + cleaned_desc)
 
-    # 우선순위 1: 수동 업로드 자막 (ASR 완전 제외)
     manual_text = _fetch_manual_transcript(video["id"])
     if manual_text:
         parts.append("【수동 자막】\n" + manual_text)
 
-    # 우선순위 2: yt_dlp subtitles URL
-    cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
-    sub_text = _fetch_subtitle_content(video.get("subtitle_urls", []), cookiefile)
+    sub_text = _fetch_subtitle_content(sub_urls, cookiefile)
     if sub_text:
         parts.append("【자막】\n" + sub_text)
         print(f"  자막 URL {len(sub_text)}자")
 
-    # 우선순위 3: 챕터 마커
-    chapters_text = _format_chapters(video.get("chapters", []))
+    chapters_text = _format_chapters(chapters)
     if chapters_text:
         parts.append("【챕터】\n" + chapters_text)
-        print(f"  챕터 {len(video.get('chapters', []))}개 사용")
+        print(f"  챕터 {len(chapters)}개 사용")
     else:
-        # 우선순위 4: 설명 타임스탬프 파싱
         desc_ts = _parse_desc_timestamps(desc)
         if desc_ts:
             parts.append("【설명 타임스탬프】\n" + desc_ts)
             print(f"  설명 타임스탬프 {len(desc_ts)}자")
 
-    # 우선순위 5: OCR (썸네일 고해상도 + 스토리보드 L2+)
     ocr_text = _ocr_all(video["id"], storyboard_spec)
     if ocr_text:
         parts.append("【화면 텍스트(OCR)】\n" + ocr_text)
@@ -428,34 +463,38 @@ def fetch_transcript(video: dict) -> dict:
 
 def summarize(video: dict) -> str:
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    content = video.get("content", "").strip()
 
-    has_content = bool(video.get("content", "").strip())
+    has_real_content = any(tag in content for tag in (
+        "【수동 자막】", "【자막】", "【챕터】",
+        "【화면 텍스트(OCR)】", "【설명 타임스탬프】",
+    )) or len(content) > 300
 
-    if has_content:
+    if has_real_content:
         prompt = (
             "너는 메이플스토리 뉴스 요약 봇이야.\n"
             "아래 영상 정보를 읽고 핵심 내용을 한국어로 요약해.\n\n"
-            "【출력 형식】\n"
-            "타임스탬프가 있으면: ▶ MM:SS 주제 제목\n"
-            "타임스탬프가 없으면: ▶ 주제 제목\n"
-            "  • 세부 내용 (날짜·아이템명·수량·수치 등 구체적으로)\n"
-            "  • ...\n\n"
-            "【규칙】\n"
+            "출력 형식:\n"
+            "타임스탬프가 있으면 -> 해당 시간대 주제 제목을 굵게\n"
+            "타임스탬프가 없으면 -> 주제 제목을 굵게\n"
+            "각 항목 아래에 세부 내용을 불렛으로 나열\n\n"
+            "규칙:\n"
             "- 한글만 사용. 한자·일본어·중국어 절대 금지\n"
             "- 날짜는 'X월 X일' 형식으로 정확히\n"
-            "- 보상 아이템·수량 반드시 포함\n"
-            "- 정보 출처에 없는 내용 작성 금지\n"
-            "- '있습니다/진행됩니다' 같은 추상 표현 금지\n"
-            "- URL·링크·웹주소 절대 포함 금지\n"
+            "- 보상 아이템·수량은 반드시 포함\n"
+            "- 출처에 없는 내용 작성 금지\n"
+            "- 추상적 표현 금지\n"
+            "- URL 포함 금지\n"
             "- 내용이 없는 항목은 생략\n\n"
             f"제목: {video['title']}\n\n"
-            f"{video['content']}\n"
+            f"{content}\n"
         )
     else:
         prompt = (
             "너는 메이플스토리 뉴스 요약 봇이야.\n"
-            "아래 제목만으로 영상 내용을 3~5줄로 유추해서 한국어로 작성해.\n"
-            "한글만 사용. 한자·일본어·중국어·URL 절대 금지.\n\n"
+            "아래 영상 제목에 핵심 정보가 담겨 있다.\n"
+            "제목에 명시된 내용만 불렛으로 정리해. 추측이나 창작 금지.\n"
+            "한글만 사용. URL 절대 금지.\n\n"
             f"제목: {video['title']}\n"
         )
 
@@ -483,7 +522,7 @@ def send_month_header(month: int, count: int) -> None:
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
     payload = {
         "embeds": [{
-            "title": f"📅 2026년 {MONTH_KR[month]} — 영상 {count}개",
+            "title": f"2026년 {MONTH_KR[month]} - 영상 {count}개",
             "color": 0x5865F2,
         }]
     }
@@ -495,7 +534,7 @@ def send_discord(video: dict, summary: str) -> None:
     published_dt = datetime.fromisoformat(video["published"])
 
     if len(summary) > 4000:
-        summary = summary[:4000] + "\n…(이하 생략)"
+        summary = summary[:4000] + "\n...(이하 생략)"
 
     embed = {
         "title": video["title"],
