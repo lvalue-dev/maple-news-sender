@@ -13,6 +13,7 @@ import yt_dlp
 from groq import Groq
 from PIL import Image, ImageEnhance
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import NoTranscriptFound
 
 CHANNEL_URL = "https://www.youtube.com/channel/UC1dHu9GhbHH7RcHKyJdaOvA/videos"
 MONTH_KR = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
@@ -32,7 +33,6 @@ def _strip_cjk(text: str) -> str:
 
 
 def _clean_text(text: str) -> str:
-    """URL 제거 및 연속 빈 줄 정리."""
     text = _URL_RE.sub('', text)
     lines = [l.rstrip() for l in text.splitlines()]
     result, prev_blank = [], False
@@ -152,6 +152,23 @@ def _fetch_subtitle_content(sub_urls: list, cookiefile: str = None) -> str:
         return ""
 
 
+def _fetch_manual_transcript(video_id: str) -> str:
+    """수동 업로드 자막만 가져온다. ASR(자동생성)은 무시."""
+    try:
+        transcript_list = YouTubeTranscriptApi().list(video_id)
+        transcript = transcript_list.find_manually_created_transcript(["ko", "ko-KR"])
+        entries = transcript.fetch()
+        text = _format_transcript(entries)
+        if text.strip():
+            print(f"  수동 자막 {len(text)}자")
+            return text
+    except NoTranscriptFound:
+        print("  수동 자막 없음 (ASR만 존재 → 건너뜀)")
+    except Exception as e:
+        print(f"  자막 API 실패: {type(e).__name__}: {e}")
+    return ""
+
+
 def _scrape_video_info(video_id: str) -> dict:
     """YouTube 페이지에서 영상 설명 + 스토리보드 spec 추출."""
     try:
@@ -172,13 +189,17 @@ def _scrape_video_info(video_id: str) -> dict:
                         .get("spec", ""))
             print(f"  페이지 스크래핑 desc={len(desc)}자 spec={'있음' if spec else '없음'}")
             return {"description": desc, "storyboard_spec": spec}
+        else:
+            status_hint = ""
+            if resp.status_code != 200:
+                status_hint = f" (HTTP {resp.status_code})"
+            print(f"  페이지 스크래핑: ytInitialPlayerResponse 없음{status_hint}")
     except Exception as e:
-        print(f"  페이지 스크래핑 실패: {type(e).__name__}")
+        print(f"  페이지 스크래핑 실패: {type(e).__name__}: {e}")
     return {"description": "", "storyboard_spec": ""}
 
 
 def _parse_storyboard(spec: str) -> list[dict]:
-    """스토리보드 spec 문자열을 파싱해 해상도 높은 순으로 레벨 목록 반환."""
     if not spec:
         return []
     parts = spec.split("|")
@@ -206,19 +227,41 @@ def _parse_storyboard(spec: str) -> list[dict]:
     return sorted(levels, key=lambda x: x["width"], reverse=True)
 
 
-def _ocr_storyboard(spec: str) -> str:
-    """스토리보드 시트를 다운로드하고 EasyOCR로 화면 텍스트를 추출한다."""
-    import easyocr
+def _run_easyocr(img: Image.Image, reader) -> str:
+    result = reader.readtext(img, detail=0, paragraph=True,
+                             text_threshold=0.5, low_text=0.3)
+    text = " ".join(result).strip()
+    text = _strip_cjk(text)
+    text = _URL_RE.sub("", text).strip()
+    return text if re.search(r'[가-힣]', text) else ""
 
+
+def _ocr_thumbnail(video_id: str, reader) -> str:
+    for quality in ("maxresdefault", "sddefault", "hqdefault"):
+        url = f"https://img.youtube.com/vi/{video_id}/{quality}.jpg"
+        try:
+            img_bytes = requests.get(url, timeout=10).content
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            if img.width < 300:
+                continue
+            img = ImageEnhance.Contrast(img).enhance(1.3)
+            text = _run_easyocr(img, reader)
+            if text:
+                print(f"  썸네일 OCR ({quality}) {len(text)}자")
+                return text
+        except Exception:
+            continue
+    return ""
+
+
+def _ocr_storyboard(spec: str, reader) -> str:
     levels = _parse_storyboard(spec)
     if not levels:
         return ""
 
-    best = next((l for l in levels if l["width"] >= 160), None)
+    best = next((l for l in levels if l["width"] >= 240), None)
     if not best:
         return ""
-
-    reader = easyocr.Reader(["ko"], verbose=False)
 
     interval_sec = best["interval_ms"] / 1000
     cols, rows = best["cols"], best["rows"]
@@ -241,27 +284,17 @@ def _ocr_storyboard(spec: str) -> str:
             for c in range(cols):
                 if frame_global_idx >= best["count"]:
                     break
-                if frame_global_idx % 3 != 0:
-                    frame_global_idx += 1
-                    continue
 
                 timestamp = frame_global_idx * interval_sec
                 frame = sheet.crop((
                     c * frame_w, r * frame_h,
                     (c + 1) * frame_w, (r + 1) * frame_h,
                 ))
-                frame = frame.resize((frame_w * 3, frame_h * 3), Image.LANCZOS)
+                frame = frame.resize((frame_w * 4, frame_h * 4), Image.LANCZOS)
                 frame = ImageEnhance.Contrast(frame).enhance(1.5)
 
-                ocr_result = reader.readtext(
-                    frame, detail=0, paragraph=True,
-                    text_threshold=0.6, low_text=0.3,
-                )
-                text = " ".join(ocr_result).strip()
-                text = _strip_cjk(text)
-                text = _URL_RE.sub("", text).strip()
-
-                if text and len(text) >= 4 and text not in seen_texts:
+                text = _run_easyocr(frame, reader)
+                if text and text not in seen_texts:
                     seen_texts.add(text)
                     m, s = divmod(int(timestamp), 60)
                     results.append((timestamp, f"[{m:02d}:{s:02d}] {text}"))
@@ -272,8 +305,28 @@ def _ocr_storyboard(spec: str) -> str:
         return ""
 
     results.sort(key=lambda x: x[0])
-    print(f"  OCR {len(results)}개 텍스트 블록 추출")
+    print(f"  스토리보드 OCR {len(results)}개 블록")
     return "\n".join(t for _, t in results)
+
+
+def _ocr_all(video_id: str, storyboard_spec: str) -> str:
+    try:
+        import easyocr
+        reader = easyocr.Reader(["ko", "en"], verbose=False)
+    except Exception as e:
+        print(f"  EasyOCR 초기화 실패: {e}")
+        return ""
+
+    thumb_text = _ocr_thumbnail(video_id, reader)
+    sb_text = _ocr_storyboard(storyboard_spec, reader)
+
+    parts = []
+    if thumb_text:
+        parts.append(f"[썸네일] {thumb_text}")
+    if sb_text:
+        parts.append(sb_text)
+
+    return "\n".join(parts)
 
 
 def fetch_feed() -> list[dict]:
@@ -339,49 +392,34 @@ def fetch_transcript(video: dict) -> dict:
     if cleaned_desc:
         parts.append("【영상 설명】\n" + cleaned_desc)
 
-    # 우선순위 1: 스토리보드 OCR
-    ocr_text = _ocr_storyboard(storyboard_spec)
+    # 우선순위 1: 수동 업로드 자막 (ASR 완전 제외)
+    manual_text = _fetch_manual_transcript(video["id"])
+    if manual_text:
+        parts.append("【수동 자막】\n" + manual_text)
+
+    # 우선순위 2: yt_dlp subtitles URL
+    cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
+    sub_text = _fetch_subtitle_content(video.get("subtitle_urls", []), cookiefile)
+    if sub_text:
+        parts.append("【자막】\n" + sub_text)
+        print(f"  자막 URL {len(sub_text)}자")
+
+    # 우선순위 3: 챕터 마커
+    chapters_text = _format_chapters(video.get("chapters", []))
+    if chapters_text:
+        parts.append("【챕터】\n" + chapters_text)
+        print(f"  챕터 {len(video.get('chapters', []))}개 사용")
+    else:
+        # 우선순위 4: 설명 타임스탬프 파싱
+        desc_ts = _parse_desc_timestamps(desc)
+        if desc_ts:
+            parts.append("【설명 타임스탬프】\n" + desc_ts)
+            print(f"  설명 타임스탬프 {len(desc_ts)}자")
+
+    # 우선순위 5: OCR (썸네일 고해상도 + 스토리보드 L2+)
+    ocr_text = _ocr_all(video["id"], storyboard_spec)
     if ocr_text:
         parts.append("【화면 텍스트(OCR)】\n" + ocr_text)
-    else:
-        # 우선순위 2: yt_dlp 챕터 마커
-        chapters_text = _format_chapters(video.get("chapters", []))
-        if chapters_text:
-            parts.append("【챕터】\n" + chapters_text)
-            print(f"  챕터 {len(video.get('chapters', []))}개 사용")
-        else:
-            # 우선순위 3: 설명 타임스탬프 파싱
-            desc_ts = _parse_desc_timestamps(desc)
-            if desc_ts:
-                parts.append("【설명 타임스탬프】\n" + desc_ts)
-                print(f"  설명 타임스탬프 {len(desc_ts)}자")
-
-        # 우선순위 4: 자막 URL 다운로드
-        cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
-        sub_text = _fetch_subtitle_content(video.get("subtitle_urls", []), cookiefile)
-        if sub_text:
-            parts.append("【자막】\n" + sub_text)
-            print(f"  자막 URL {len(sub_text)}자")
-        else:
-            # 우선순위 5: youtube_transcript_api fallback
-            try:
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video["id"])
-                transcript = None
-                for lang in (["ko", "ko-KR"], ["a.ko"]):
-                    try:
-                        transcript = transcript_list.find_transcript(lang)
-                        break
-                    except Exception:
-                        continue
-                if transcript is None:
-                    transcript = next(iter(transcript_list))
-                entries = transcript.fetch()
-                t_text = _format_transcript(entries)
-                if t_text.strip():
-                    parts.append("【자막】\n" + t_text.strip())
-                    print(f"  자막 API {len(t_text)}자 ({transcript.language_code})")
-            except Exception as e:
-                print(f"  자막 없음: {type(e).__name__}")
 
     content = "\n\n".join(parts)
     print(f"  최종 콘텐츠 {len(content)}자")
@@ -396,9 +434,10 @@ def summarize(video: dict) -> str:
     if has_content:
         prompt = (
             "너는 메이플스토리 뉴스 요약 봇이야.\n"
-            "아래 영상 정보를 읽고, 주제가 바뀌는 지점마다 타임라인 항목을 만들어.\n\n"
+            "아래 영상 정보를 읽고 핵심 내용을 한국어로 요약해.\n\n"
             "【출력 형식】\n"
-            "▶ MM:SS 주제 제목  (타임스탬프 없으면 ▶ 주제 제목)\n"
+            "타임스탬프가 있으면: ▶ MM:SS 주제 제목\n"
+            "타임스탬프가 없으면: ▶ 주제 제목\n"
             "  • 세부 내용 (날짜·아이템명·수량·수치 등 구체적으로)\n"
             "  • ...\n\n"
             "【규칙】\n"
@@ -407,15 +446,15 @@ def summarize(video: dict) -> str:
             "- 보상 아이템·수량 반드시 포함\n"
             "- 정보 출처에 없는 내용 작성 금지\n"
             "- '있습니다/진행됩니다' 같은 추상 표현 금지\n"
-            "- URL·링크·웹주소 절대 포함 금지\n\n"
+            "- URL·링크·웹주소 절대 포함 금지\n"
+            "- 내용이 없는 항목은 생략\n\n"
             f"제목: {video['title']}\n\n"
             f"{video['content']}\n"
         )
     else:
         prompt = (
             "너는 메이플스토리 뉴스 요약 봇이야.\n"
-            "자막을 구하지 못해 제목만으로 요약해야 해.\n"
-            "제목에서 유추할 수 있는 내용을 한국어로 3~5줄로 작성해.\n"
+            "아래 제목만으로 영상 내용을 3~5줄로 유추해서 한국어로 작성해.\n"
             "한글만 사용. 한자·일본어·중국어·URL 절대 금지.\n\n"
             f"제목: {video['title']}\n"
         )
