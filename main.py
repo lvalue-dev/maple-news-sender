@@ -19,10 +19,25 @@ _CJK_RE = re.compile(
     r'一-鿿'    # CJK 통합 한자
     r'豈-﫿]'   # CJK 호환 한자
 )
+_URL_RE = re.compile(r'https?://\S+|www\.\S+')
 
 
 def _strip_cjk(text: str) -> str:
     return _CJK_RE.sub('', text)
+
+
+def _clean_text(text: str) -> str:
+    """URL 제거 및 연속 빈 줄 정리."""
+    text = _URL_RE.sub('', text)
+    lines = [l.rstrip() for l in text.splitlines()]
+    result, prev_blank = [], False
+    for l in lines:
+        blank = l.strip() == ''
+        if blank and prev_blank:
+            continue
+        result.append(l)
+        prev_blank = blank
+    return '\n'.join(result).strip()
 
 
 def _date_to_iso(upload_date: str) -> str:
@@ -35,7 +50,8 @@ def _format_transcript(entries: list) -> str:
     groups: dict[int, list[str]] = {}
     for t in entries:
         text = t["text"].strip()
-        if len(text) < 4:
+        # 한글·알파벳·숫자가 없는 항목(구두점·음표·점 등) 제거
+        if len(text) < 4 or not re.search(r'[가-힣a-zA-Z0-9]', text):
             continue
         bucket = int(t["start"] // 30) * 30
         groups.setdefault(bucket, []).append(text)
@@ -132,6 +148,29 @@ def _fetch_subtitle_content(sub_urls: list, cookiefile: str = None) -> str:
         return ""
 
 
+def _scrape_video_description(video_id: str) -> str:
+    """YouTube 페이지의 ytInitialPlayerResponse에서 영상 전체 설명 추출."""
+    try:
+        resp = requests.get(
+            f"https://www.youtube.com/watch?v={video_id}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "ko-KR,ko;q=0.9",
+            },
+            timeout=15,
+        )
+        match = re.search(r'ytInitialPlayerResponse\s*=\s*', resp.text)
+        if match:
+            data, _ = json.JSONDecoder().raw_decode(resp.text, match.end())
+            desc = data.get("videoDetails", {}).get("shortDescription", "")
+            if desc:
+                print(f"  페이지 스크래핑 {len(desc)}자")
+                return desc
+    except Exception as e:
+        print(f"  페이지 스크래핑 실패: {type(e).__name__}")
+    return ""
+
+
 def load_seen() -> set:
     if SEEN_FILE.exists():
         return set(json.loads(SEEN_FILE.read_text()))
@@ -173,16 +212,14 @@ def fetch_feed() -> list[dict]:
             continue
         chapters = entry.get("chapters") or []
         sub_urls = _extract_sub_urls(entry)
-        if chapters:
-            print(f"  [{entry.get('title', '')[:20]}] 챕터 {len(chapters)}개")
-        if sub_urls:
-            print(f"  [{entry.get('title', '')[:20]}] 자막 URL {len(sub_urls)}개")
+        desc = entry.get("description", "") or ""
+        print(f"  [{entry.get('title', '')[:25]}] desc={len(desc)}자 chapters={len(chapters)} subs={len(sub_urls)}")
         videos.append({
             "id": entry["id"],
             "title": entry.get("title", ""),
             "link": f"https://www.youtube.com/watch?v={entry['id']}",
             "published": _date_to_iso(entry.get("upload_date", "")),
-            "description": entry.get("description", "") or "",
+            "description": desc,
             "chapters": chapters,
             "subtitle_urls": sub_urls,
         })
@@ -192,8 +229,16 @@ def fetch_feed() -> list[dict]:
 def fetch_transcript(video: dict) -> dict:
     parts = []
 
-    if video.get("description", "").strip():
-        parts.append("【영상 설명】\n" + video["description"].strip())
+    # description이 짧으면 페이지 스크래핑으로 보완
+    desc = video.get("description", "").strip()
+    if len(desc) < 100:
+        scraped = _scrape_video_description(video["id"])
+        if len(scraped) > len(desc):
+            desc = scraped
+
+    cleaned_desc = _clean_text(desc)
+    if cleaned_desc:
+        parts.append("【영상 설명】\n" + cleaned_desc)
 
     # 우선순위 1: yt_dlp 챕터 마커
     chapters_text = _format_chapters(video.get("chapters", []))
@@ -202,12 +247,12 @@ def fetch_transcript(video: dict) -> dict:
         print(f"  챕터 {len(video.get('chapters', []))}개 사용")
     else:
         # 우선순위 2: 설명 타임스탬프 파싱
-        desc_ts = _parse_desc_timestamps(video.get("description", ""))
+        desc_ts = _parse_desc_timestamps(desc)
         if desc_ts:
             parts.append("【설명 타임스탬프】\n" + desc_ts)
             print(f"  설명 타임스탬프 {len(desc_ts)}자")
 
-    # 우선순위 3: 자막 URL 다운로드 (yt_dlp full 추출에서 얻은 URL)
+    # 우선순위 3: 자막 URL 다운로드
     cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
     sub_text = _fetch_subtitle_content(video.get("subtitle_urls", []), cookiefile)
     if sub_text:
@@ -257,7 +302,8 @@ def summarize(video: dict) -> str:
             "- 날짜는 'X월 X일' 형식으로 정확히\n"
             "- 보상 아이템·수량 반드시 포함\n"
             "- 정보 출처에 없는 내용 작성 금지\n"
-            "- '있습니다/진행됩니다' 같은 추상 표현 금지\n\n"
+            "- '있습니다/진행됩니다' 같은 추상 표현 금지\n"
+            "- URL·링크·웹주소 절대 포함 금지\n\n"
             f"제목: {video['title']}\n\n"
             f"{video['content']}\n"
         )
@@ -265,7 +311,7 @@ def summarize(video: dict) -> str:
         prompt = (
             "너는 메이플스토리 뉴스 요약 봇이야.\n"
             "아래 제목만으로 영상 내용을 3~5줄로 유추해서 한국어로 작성해.\n"
-            "한글만 사용. 한자·일본어·중국어 절대 금지.\n\n"
+            "한글만 사용. 한자·일본어·중국어·URL 절대 금지.\n\n"
             f"제목: {video['title']}\n"
         )
 
@@ -276,7 +322,9 @@ def summarize(video: dict) -> str:
                 messages=[{"role": "user", "content": prompt}],
             )
             result = response.choices[0].message.content.strip()
-            return _strip_cjk(result)
+            result = _strip_cjk(result)
+            result = _URL_RE.sub('', result).strip()
+            return result
         except Exception as e:
             if "429" in str(e) or "rate_limit" in str(e).lower():
                 wait = 30 * (attempt + 1)
