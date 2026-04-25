@@ -1,3 +1,5 @@
+import io
+import math
 import os
 import json
 import re
@@ -9,6 +11,7 @@ from datetime import datetime
 import requests
 import yt_dlp
 from groq import Groq
+from PIL import Image, ImageEnhance
 from youtube_transcript_api import YouTubeTranscriptApi
 
 CHANNEL_URL = "https://www.youtube.com/channel/UC1dHu9GhbHH7RcHKyJdaOvA/videos"
@@ -52,7 +55,6 @@ def _format_transcript(entries: list) -> str:
     groups: dict[int, list[str]] = {}
     for t in entries:
         text = t["text"].strip()
-        # 한글·알파벳·숫자가 없는 항목(구두점·음표·점 등) 제거
         if len(text) < 4 or not re.search(r'[가-힣a-zA-Z0-9]', text):
             continue
         bucket = int(t["start"] // 30) * 30
@@ -150,8 +152,8 @@ def _fetch_subtitle_content(sub_urls: list, cookiefile: str = None) -> str:
         return ""
 
 
-def _scrape_video_description(video_id: str) -> str:
-    """YouTube 페이지의 ytInitialPlayerResponse에서 영상 전체 설명 추출."""
+def _scrape_video_info(video_id: str) -> dict:
+    """YouTube 페이지에서 영상 설명 + 스토리보드 spec 추출."""
     try:
         resp = requests.get(
             f"https://www.youtube.com/watch?v={video_id}",
@@ -165,12 +167,113 @@ def _scrape_video_description(video_id: str) -> str:
         if match:
             data, _ = json.JSONDecoder().raw_decode(resp.text, match.end())
             desc = data.get("videoDetails", {}).get("shortDescription", "")
-            if desc:
-                print(f"  페이지 스크래핑 {len(desc)}자")
-                return desc
+            spec = (data.get("storyboards", {})
+                        .get("playerStoryboardSpecRenderer", {})
+                        .get("spec", ""))
+            print(f"  페이지 스크래핑 desc={len(desc)}자 spec={'있음' if spec else '없음'}")
+            return {"description": desc, "storyboard_spec": spec}
     except Exception as e:
         print(f"  페이지 스크래핑 실패: {type(e).__name__}")
-    return ""
+    return {"description": "", "storyboard_spec": ""}
+
+
+def _parse_storyboard(spec: str) -> list[dict]:
+    """스토리보드 spec 문자열을 파싱해 해상도 높은 순으로 레벨 목록 반환."""
+    if not spec:
+        return []
+    parts = spec.split("|")
+    base_url = parts[0]
+    levels = []
+    for level_idx, params_str in enumerate(parts[1:]):
+        p = params_str.split("#")
+        if len(p) < 6:
+            continue
+        try:
+            w, h, count, interval_ms, cols, rows = (
+                int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]), int(p[5])
+            )
+        except ValueError:
+            continue
+        sigh = p[6] if len(p) > 6 else ""
+        sheet_url_base = base_url.replace("$L", str(level_idx)).replace("$N", sigh)
+        sheets_needed = math.ceil(count / (cols * rows))
+        levels.append({
+            "width": w, "height": h, "count": count,
+            "interval_ms": interval_ms, "cols": cols, "rows": rows,
+            "sheet_url_base": sheet_url_base,
+            "sheets_needed": sheets_needed,
+        })
+    return sorted(levels, key=lambda x: x["width"], reverse=True)
+
+
+def _ocr_storyboard(spec: str) -> str:
+    """스토리보드 시트를 다운로드하고 EasyOCR로 화면 텍스트를 추출한다."""
+    import easyocr
+
+    levels = _parse_storyboard(spec)
+    if not levels:
+        return ""
+
+    best = next((l for l in levels if l["width"] >= 160), None)
+    if not best:
+        return ""
+
+    reader = easyocr.Reader(["ko"], verbose=False)
+
+    interval_sec = best["interval_ms"] / 1000
+    cols, rows = best["cols"], best["rows"]
+    frame_w, frame_h = best["width"], best["height"]
+
+    seen_texts: set[str] = set()
+    results: list[tuple[float, str]] = []
+    frame_global_idx = 0
+
+    for sheet_idx in range(best["sheets_needed"]):
+        url = best["sheet_url_base"] + f"M{sheet_idx}.jpg"
+        try:
+            img_bytes = requests.get(url, timeout=10).content
+            sheet = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception:
+            frame_global_idx += cols * rows
+            continue
+
+        for r in range(rows):
+            for c in range(cols):
+                if frame_global_idx >= best["count"]:
+                    break
+                if frame_global_idx % 3 != 0:
+                    frame_global_idx += 1
+                    continue
+
+                timestamp = frame_global_idx * interval_sec
+                frame = sheet.crop((
+                    c * frame_w, r * frame_h,
+                    (c + 1) * frame_w, (r + 1) * frame_h,
+                ))
+                frame = frame.resize((frame_w * 3, frame_h * 3), Image.LANCZOS)
+                frame = ImageEnhance.Contrast(frame).enhance(1.5)
+
+                ocr_result = reader.readtext(
+                    frame, detail=0, paragraph=True,
+                    text_threshold=0.6, low_text=0.3,
+                )
+                text = " ".join(ocr_result).strip()
+                text = _strip_cjk(text)
+                text = _URL_RE.sub("", text).strip()
+
+                if text and len(text) >= 4 and text not in seen_texts:
+                    seen_texts.add(text)
+                    m, s = divmod(int(timestamp), 60)
+                    results.append((timestamp, f"[{m:02d}:{s:02d}] {text}"))
+
+                frame_global_idx += 1
+
+    if not results:
+        return ""
+
+    results.sort(key=lambda x: x[0])
+    print(f"  OCR {len(results)}개 텍스트 블록 추출")
+    return "\n".join(t for _, t in results)
 
 
 def fetch_feed() -> list[dict]:
@@ -214,6 +317,7 @@ def fetch_feed() -> list[dict]:
             "description": desc,
             "chapters": chapters,
             "subtitle_urls": sub_urls,
+            "storyboard_spec": "",
         })
     return videos
 
@@ -221,55 +325,63 @@ def fetch_feed() -> list[dict]:
 def fetch_transcript(video: dict) -> dict:
     parts = []
 
-    # description이 짧으면 페이지 스크래핑으로 보완
     desc = video.get("description", "").strip()
-    if len(desc) < 100:
-        scraped = _scrape_video_description(video["id"])
-        if len(scraped) > len(desc):
-            desc = scraped
+    storyboard_spec = video.get("storyboard_spec", "")
+
+    if len(desc) < 100 or not storyboard_spec:
+        info = _scrape_video_info(video["id"])
+        if len(info.get("description", "")) > len(desc):
+            desc = info["description"]
+        if not storyboard_spec:
+            storyboard_spec = info.get("storyboard_spec", "")
 
     cleaned_desc = _clean_text(desc)
     if cleaned_desc:
         parts.append("【영상 설명】\n" + cleaned_desc)
 
-    # 우선순위 1: yt_dlp 챕터 마커
-    chapters_text = _format_chapters(video.get("chapters", []))
-    if chapters_text:
-        parts.append("【챕터】\n" + chapters_text)
-        print(f"  챕터 {len(video.get('chapters', []))}개 사용")
+    # 우선순위 1: 스토리보드 OCR
+    ocr_text = _ocr_storyboard(storyboard_spec)
+    if ocr_text:
+        parts.append("【화면 텍스트(OCR)】\n" + ocr_text)
     else:
-        # 우선순위 2: 설명 타임스탬프 파싱
-        desc_ts = _parse_desc_timestamps(desc)
-        if desc_ts:
-            parts.append("【설명 타임스탬프】\n" + desc_ts)
-            print(f"  설명 타임스탬프 {len(desc_ts)}자")
+        # 우선순위 2: yt_dlp 챕터 마커
+        chapters_text = _format_chapters(video.get("chapters", []))
+        if chapters_text:
+            parts.append("【챕터】\n" + chapters_text)
+            print(f"  챕터 {len(video.get('chapters', []))}개 사용")
+        else:
+            # 우선순위 3: 설명 타임스탬프 파싱
+            desc_ts = _parse_desc_timestamps(desc)
+            if desc_ts:
+                parts.append("【설명 타임스탬프】\n" + desc_ts)
+                print(f"  설명 타임스탬프 {len(desc_ts)}자")
 
-    # 우선순위 3: 자막 URL 다운로드
-    cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
-    sub_text = _fetch_subtitle_content(video.get("subtitle_urls", []), cookiefile)
-    if sub_text:
-        parts.append("【자막】\n" + sub_text)
-        print(f"  자막 URL {len(sub_text)}자")
-    else:
-        # 우선순위 4: youtube_transcript_api fallback
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video["id"])
-            transcript = None
-            for lang in (["ko", "ko-KR"], ["a.ko"]):
-                try:
-                    transcript = transcript_list.find_transcript(lang)
-                    break
-                except Exception:
-                    continue
-            if transcript is None:
-                transcript = next(iter(transcript_list))
-            entries = transcript.fetch()
-            t_text = _format_transcript(entries)
-            if t_text.strip():
-                parts.append("【자막】\n" + t_text.strip())
-                print(f"  자막 API {len(t_text)}자 ({transcript.language_code})")
-        except Exception as e:
-            print(f"  자막 없음: {type(e).__name__}")
+        # 우선순위 4: 자막 URL 다운로드
+        cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
+        sub_text = _fetch_subtitle_content(video.get("subtitle_urls", []), cookiefile)
+        if sub_text:
+            parts.append("【자막】\n" + sub_text)
+            print(f"  자막 URL {len(sub_text)}자")
+        else:
+            # 우선순위 5: youtube_transcript_api fallback
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video["id"])
+                transcript = None
+                for lang in (["ko", "ko-KR"], ["a.ko"]):
+                    try:
+                        transcript = transcript_list.find_transcript(lang)
+                        break
+                    except Exception:
+                        continue
+                if transcript is None:
+                    transcript = next(iter(transcript_list))
+                entries = transcript.fetch()
+                t_text = _format_transcript(entries)
+                if t_text.strip():
+                    parts.append("【자막】\n" + t_text.strip())
+                    print(f"  자막 API {len(t_text)}자 ({transcript.language_code})")
+            except Exception as e:
+                print(f"  자막 없음: {type(e).__name__}")
 
     content = "\n\n".join(parts)
     print(f"  최종 콘텐츠 {len(content)}자")
