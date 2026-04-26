@@ -61,11 +61,36 @@ def download_video(video_id: str, output_path: str) -> bool:
     ydl_opts = {
         "format": "worstvideo[ext=mp4]/worstvideo",
         "outtmpl": output_path,
-        "quiet": False,  # 다운로드 포맷/해상도 확인용
+        "quiet": False,
         "no_warnings": True,
     }
     if os.path.exists("cookies.txt"):
         ydl_opts["cookiefile"] = "cookies.txt"
+    else:
+        # 로컬 환경: 브라우저 쿠키 자동 사용
+        for browser in ("chrome", "firefox", "edge", "safari"):
+            try:
+                test_opts = {**ydl_opts, "cookiesfrombrowser": (browser,)}
+                with yt_dlp.YoutubeDL(test_opts) as ydl:
+                    ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+                print(f"  {browser} 쿠키로 다운로드 성공")
+                return True
+            except Exception as e:
+                if "Sign in" in str(e) or "bot" in str(e).lower():
+                    continue
+                if "cookiesfrombrowser" in str(e).lower() or "no cookies" in str(e).lower():
+                    continue
+                print(f"  영상 다운로드 실패: {type(e).__name__}: {e}")
+                return False
+        print("  브라우저 쿠키 없음 — cookies.txt가 필요합니다")
+        return False
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        return True
+    except Exception as e:
+        print(f"  영상 다운로드 실패: {type(e).__name__}: {e}")
+        return False
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
