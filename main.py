@@ -211,13 +211,15 @@ def _scrape_video_info(video_id: str, cookiefile: str = None) -> dict:
     return {"description": "", "storyboard_spec": ""}
 
 
-def _fetch_video_details_ytdlp(video_id: str, cookiefile: str) -> dict:
+def _fetch_video_details_ytdlp(video_id: str, cookiefile: str = None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "cookiefile": cookiefile,
+        "nocheckcertificate": True,
     }
+    if cookiefile and os.path.exists(cookiefile):
+        opts["cookiefile"] = cookiefile
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(
@@ -227,8 +229,9 @@ def _fetch_video_details_ytdlp(video_id: str, cookiefile: str) -> dict:
         desc = info.get("description", "") or ""
         chapters = info.get("chapters") or []
         sub_urls = _extract_sub_urls(info)
-        print(f"  yt-dlp 개별 추출 desc={len(desc)}자 chapters={len(chapters)} subs={len(sub_urls)}")
-        return {"description": desc, "chapters": chapters, "subtitle_urls": sub_urls}
+        sb_info = _extract_storyboard_from_ytdlp(info)
+        print(f"  yt-dlp desc={len(desc)}자 chapters={len(chapters)} subs={len(sub_urls)} sb={'있음' if sb_info else '없음'}")
+        return {"description": desc, "chapters": chapters, "subtitle_urls": sub_urls, "storyboard_info": sb_info}
     except Exception as e:
         print(f"  yt-dlp 개별 추출 실패: {type(e).__name__}: {e}")
         return {}
@@ -338,7 +341,81 @@ def _ocr_storyboard(spec: str, reader) -> str:
     return "\n".join(t for _, t in results)
 
 
-def _ocr_all(video_id: str, storyboard_spec: str) -> str:
+def _extract_storyboard_from_ytdlp(info: dict) -> dict:
+    """yt-dlp info의 formats에서 스토리보드 fragment URL 추출."""
+    formats = info.get("formats") or []
+    sb_formats = [
+        f for f in formats
+        if (f.get("format_id") or "").startswith("sb")
+        and f.get("width")
+        and f.get("fragments")
+    ]
+    if not sb_formats:
+        return {}
+    sb_formats.sort(key=lambda f: f.get("width", 0), reverse=True)
+    best = next((f for f in sb_formats if (f.get("width") or 0) >= 240), sb_formats[0])
+    cols = best.get("columns") or best.get("cols") or 5
+    rows = best.get("rows") or 5
+    return {
+        "width": best.get("width", 0),
+        "height": best.get("height", 0),
+        "cols": cols,
+        "rows": rows,
+        "fragments": best.get("fragments", []),
+    }
+
+
+def _ocr_storyboard_fragments(sb_info: dict, reader) -> str:
+    """yt-dlp fragment URL 목록으로 스토리보드 OCR."""
+    if not sb_info or not sb_info.get("fragments"):
+        return ""
+    frame_w = sb_info["width"]
+    frame_h = sb_info["height"]
+    cols = sb_info["cols"]
+    rows = sb_info["rows"]
+    seen_texts: set[str] = set()
+    results: list[tuple[float, str]] = []
+    elapsed = 0.0
+
+    for frag in sb_info["fragments"]:
+        url = frag.get("url", "")
+        frag_dur = frag.get("duration") or 0
+        if not url:
+            elapsed += frag_dur
+            continue
+        try:
+            img_bytes = requests.get(url, timeout=15).content
+            sheet = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception:
+            elapsed += frag_dur
+            continue
+
+        frames_in_sheet = cols * rows
+        frame_dur = frag_dur / frames_in_sheet if frames_in_sheet else 1
+        for r in range(rows):
+            for c in range(cols):
+                frame = sheet.crop((
+                    c * frame_w, r * frame_h,
+                    (c + 1) * frame_w, (r + 1) * frame_h,
+                ))
+                frame = frame.resize((frame_w * 4, frame_h * 4), Image.LANCZOS)
+                frame = ImageEnhance.Contrast(frame).enhance(1.5)
+                text = _run_easyocr(frame, reader)
+                if text and text not in seen_texts:
+                    seen_texts.add(text)
+                    ts = elapsed + (r * cols + c) * frame_dur
+                    m, s = divmod(int(ts), 60)
+                    results.append((ts, f"[{m:02d}:{s:02d}] {text}"))
+        elapsed += frag_dur
+
+    if not results:
+        return ""
+    results.sort(key=lambda x: x[0])
+    print(f"  스토리보드 OCR (fragments) {len(results)}개 블록")
+    return "\n".join(t for _, t in results)
+
+
+def _ocr_all(video_id: str, storyboard_spec: str, storyboard_info: dict = None) -> str:
     try:
         import easyocr
         reader = easyocr.Reader(["ko", "en"], verbose=False)
@@ -346,7 +423,10 @@ def _ocr_all(video_id: str, storyboard_spec: str) -> str:
         print(f"  EasyOCR 초기화 실패: {e}")
         return ""
     thumb_text = _ocr_thumbnail(video_id, reader)
-    sb_text = _ocr_storyboard(storyboard_spec, reader)
+    if storyboard_info:
+        sb_text = _ocr_storyboard_fragments(storyboard_info, reader)
+    else:
+        sb_text = _ocr_storyboard(storyboard_spec, reader)
     parts = []
     if thumb_text:
         parts.append(f"[썸네일] {thumb_text}")
@@ -397,7 +477,8 @@ def fetch_feed() -> list[dict]:
         chapters = entry.get("chapters") or []
         sub_urls = _extract_sub_urls(entry)
         desc = entry.get("description", "") or ""
-        print(f"  [{entry.get('title', '')[:25]}] desc={len(desc)}자 chapters={len(chapters)} subs={len(sub_urls)}")
+        sb_info = _extract_storyboard_from_ytdlp(entry) if entry.get("formats") else {}
+        print(f"  [{entry.get('title', '')[:25]}] desc={len(desc)}자 chapters={len(chapters)} sb={'있음' if sb_info else '없음'}")
         videos.append({
             "id": entry["id"],
             "title": entry.get("title", ""),
@@ -407,6 +488,7 @@ def fetch_feed() -> list[dict]:
             "chapters": chapters,
             "subtitle_urls": sub_urls,
             "storyboard_spec": "",
+            "storyboard_info": sb_info,
         })
     return videos
 
@@ -416,26 +498,27 @@ def fetch_transcript(video: dict) -> dict:
     parts = []
 
     desc = video.get("description", "").strip()
-    storyboard_spec = video.get("storyboard_spec", "")
     chapters = list(video.get("chapters") or [])
     sub_urls = list(video.get("subtitle_urls") or [])
+    storyboard_spec = ""
+    storyboard_info = video.get("storyboard_info") or {}
 
-    if len(desc) < 100 or not storyboard_spec:
-        info = _scrape_video_info(video["id"], cookiefile)
-        if len(info.get("description", "")) > len(desc):
-            desc = info["description"]
-        if not storyboard_spec:
-            storyboard_spec = info.get("storyboard_spec", "")
+    # yt-dlp 개별 추출 (쿠키 없이도 공개 영상은 storyboard fragment URL 획득 가능)
+    detail = _fetch_video_details_ytdlp(video["id"], cookiefile)
+    if detail:
+        if len(detail.get("description", "")) > len(desc):
+            desc = detail["description"]
+        chapters = chapters or detail.get("chapters", [])
+        sub_urls = sub_urls or detail.get("subtitle_urls", [])
+        if not storyboard_info:
+            storyboard_info = detail.get("storyboard_info", {})
 
-    if len(desc) < 100 and cookiefile:
-        detail = _fetch_video_details_ytdlp(video["id"], cookiefile)
-        if detail:
-            if len(detail.get("description", "")) > len(desc):
-                desc = detail["description"]
-            if not chapters:
-                chapters = detail.get("chapters", [])
-            if not sub_urls:
-                sub_urls = detail.get("subtitle_urls", [])
+    # 페이지 스크래핑 (storyboard 획득 실패 시 spec 방식 시도, 쿠키 필요)
+    if not storyboard_info:
+        scraped = _scrape_video_info(video["id"], cookiefile)
+        if len(scraped.get("description", "")) > len(desc):
+            desc = scraped["description"]
+        storyboard_spec = scraped.get("storyboard_spec", "")
 
     cleaned_desc = _clean_text(desc)
     if cleaned_desc:
@@ -460,7 +543,7 @@ def fetch_transcript(video: dict) -> dict:
             parts.append("【설명 타임스탬프】\n" + desc_ts)
             print(f"  설명 타임스탬프 {len(desc_ts)}자")
 
-    ocr_text = _ocr_all(video["id"], storyboard_spec)
+    ocr_text = _ocr_all(video["id"], storyboard_spec, storyboard_info)
     if ocr_text:
         parts.append("【화면 텍스트(OCR)】\n" + ocr_text)
 
