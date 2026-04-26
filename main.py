@@ -415,7 +415,90 @@ def _ocr_storyboard_fragments(sb_info: dict, reader) -> str:
     return "\n".join(t for _, t in results)
 
 
-def _ocr_all(video_id: str, storyboard_spec: str, storyboard_info: dict = None) -> str:
+def _ocr_video_frames(video_id: str, reader, cookiefile: str = None) -> str:
+    """저화질 영상 다운로드 + FFmpeg 프레임 추출 + OCR (스토리보드 실패 시 fallback)."""
+    import subprocess
+    import glob
+    import tempfile
+
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
+    except Exception:
+        print("  FFmpeg 없음, 영상 직접 OCR 건너뜀")
+        return ""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ydl_opts = {
+            "format": "worst[ext=mp4]/worst",
+            "outtmpl": os.path.join(tmpdir, "v.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+        }
+        if cookiefile and os.path.exists(cookiefile):
+            ydl_opts["cookiefile"] = cookiefile
+        try:
+            from yt_dlp.utils import download_range_func
+            ydl_opts["download_ranges"] = download_range_func(None, [(0, 300)])
+            ydl_opts["force_keyframes_at_cuts"] = True
+        except (ImportError, AttributeError):
+            pass
+
+        print(f"  영상 저화질 다운로드 중 (최대 5분)...")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        except Exception as e:
+            print(f"  영상 다운로드 실패: {type(e).__name__}")
+            return ""
+
+        files = glob.glob(os.path.join(tmpdir, "v.*"))
+        if not files:
+            return ""
+
+        frames_dir = os.path.join(tmpdir, "f")
+        os.makedirs(frames_dir)
+        ret = subprocess.run(
+            ["ffmpeg", "-i", files[0], "-vf", "fps=1/5",
+             os.path.join(frames_dir, "%05d.jpg"),
+             "-q:v", "3", "-loglevel", "error"],
+            capture_output=True, timeout=180,
+        )
+        if ret.returncode != 0:
+            print("  FFmpeg 프레임 추출 실패")
+            return ""
+
+        frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+        if not frame_files:
+            return ""
+
+        seen_texts: set[str] = set()
+        results: list[tuple[int, str]] = []
+
+        for i, fpath in enumerate(frame_files):
+            timestamp = i * 5
+            try:
+                img = Image.open(fpath).convert("RGB")
+            except Exception:
+                continue
+            img = ImageEnhance.Contrast(img).enhance(1.3)
+            raw = reader.readtext(img, detail=0, paragraph=False,
+                                   text_threshold=0.4, low_text=0.3)
+            text = " ".join(raw).strip()
+            text = _strip_cjk(text)
+            text = _URL_RE.sub("", text).strip()
+            if text and re.search(r'[가-힣]', text) and text not in seen_texts:
+                seen_texts.add(text)
+                m, s = divmod(timestamp, 60)
+                results.append((timestamp, f"[{m:02d}:{s:02d}] {text}"))
+
+        if results:
+            print(f"  영상 직접 OCR {len(results)}개 블록")
+            return "\n".join(t for _, t in results)
+        return ""
+
+
+def _ocr_all(video_id: str, storyboard_spec: str, storyboard_info: dict = None, cookiefile: str = None) -> str:
     try:
         import easyocr
         reader = easyocr.Reader(["ko", "en"], verbose=False)
@@ -427,6 +510,9 @@ def _ocr_all(video_id: str, storyboard_spec: str, storyboard_info: dict = None) 
         sb_text = _ocr_storyboard_fragments(storyboard_info, reader)
     else:
         sb_text = _ocr_storyboard(storyboard_spec, reader)
+    # 스토리보드로 텍스트를 못 얻으면 영상 직접 다운로드 OCR
+    if not sb_text:
+        sb_text = _ocr_video_frames(video_id, reader, cookiefile)
     parts = []
     if thumb_text:
         parts.append(f"[썸네일] {thumb_text}")
@@ -543,7 +629,7 @@ def fetch_transcript(video: dict) -> dict:
             parts.append("【설명 타임스탬프】\n" + desc_ts)
             print(f"  설명 타임스탬프 {len(desc_ts)}자")
 
-    ocr_text = _ocr_all(video["id"], storyboard_spec, storyboard_info)
+    ocr_text = _ocr_all(video["id"], storyboard_spec, storyboard_info, cookiefile)
     if ocr_text:
         parts.append("【화면 텍스트(OCR)】\n" + ocr_text)
 
