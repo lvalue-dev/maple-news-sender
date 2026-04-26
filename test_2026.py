@@ -55,7 +55,7 @@ def download_video(video_id: str, output_path: str) -> bool:
     ydl_opts = {
         "format": "worstvideo[ext=mp4]/worstvideo",
         "outtmpl": output_path,
-        "quiet": True,
+        "quiet": False,  # 다운로드 포맷/해상도 확인용
         "no_warnings": True,
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
@@ -72,7 +72,12 @@ def download_video(video_id: str, output_path: str) -> bool:
 
 def extract_text_from_video(video_path: str, reader) -> str:
     cap = cv2.VideoCapture(video_path)
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"  영상 정보: {src_w}x{src_h} / {fps:.1f}fps / 총 {total_frames}프레임 ({total_frames/fps:.0f}초)")
+
     sample_every = max(1, int(fps * FRAME_INTERVAL_SECONDS))
     extracted_texts = []
     last_text = ""
@@ -92,6 +97,12 @@ def extract_text_from_video(video_path: str, reader) -> str:
         count += 1
     cap.release()
     print(f"  영상 OCR {len(extracted_texts)}개 블록")
+    # 실제 추출된 텍스트 전체 출력 (AI에 전달되는 내용 확인)
+    if extracted_texts:
+        print("  ---- OCR 추출 텍스트 시작 ----")
+        for i, t in enumerate(extracted_texts):
+            print(f"  [{i+1}] {t}")
+        print("  ---- OCR 추출 텍스트 끝 ----")
     return "\n".join(extracted_texts)
 
 
