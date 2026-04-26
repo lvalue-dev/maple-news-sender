@@ -111,7 +111,7 @@ def fetch_feed() -> list[dict]:
 def download_video(video_id: str, output_path: str, cookiefile: str | None) -> bool:
     opts = {
         "format": "worstvideo[ext=mp4]/worst[ext=mp4]/worstvideo/worst",
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
+        "extractor_args": {"youtube": {"player_client": ["web"]}},
         "outtmpl": output_path,
         "quiet": False,
         "no_warnings": True,
@@ -131,6 +131,9 @@ def download_video(video_id: str, output_path: str, cookiefile: str | None) -> b
     }
     if cookiefile:
         opts["cookiefile"] = cookiefile
+
+    client = opts.get("extractor_args", {}).get("youtube", {}).get("player_client", ["?"])
+    print(f"  [yt-dlp] client={client} cookiefile={'있음' if cookiefile else '없음'}")
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
