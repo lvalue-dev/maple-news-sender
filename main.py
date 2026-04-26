@@ -5,6 +5,7 @@ import os
 import json
 import re
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
@@ -15,8 +16,17 @@ from PIL import Image, ImageEnhance
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound
 
-CHANNEL_URL = "https://www.youtube.com/channel/UC1dHu9GhbHH7RcHKyJdaOvA/videos"
+CHANNEL_ID = "UC1dHu9GhbHH7RcHKyJdaOvA"
+CHANNEL_URL = f"https://www.youtube.com/channel/{CHANNEL_ID}/videos"
 SEEN_FILE = Path("seen_videos.json")
+
+# 모든 yt-dlp 호출에 Android 클라이언트 강제 (GitHub Actions IP 봇 감지 우회)
+_YT_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "nocheckcertificate": True,
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+}
 
 _CJK_RE = re.compile(
     r'[぀-ヿ'
@@ -212,12 +222,7 @@ def _scrape_video_info(video_id: str, cookiefile: str = None) -> dict:
 
 
 def _fetch_video_details_ytdlp(video_id: str, cookiefile: str = None) -> dict:
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "nocheckcertificate": True,
-    }
+    opts = {**_YT_OPTS, "skip_download": True}
     if cookiefile and os.path.exists(cookiefile):
         opts["cookiefile"] = cookiefile
     try:
@@ -428,13 +433,8 @@ def _ocr_video_frames(video_id: str, reader, cookiefile: str = None) -> str:
         return ""
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        ydl_opts = {
-            "format": "worst[ext=mp4]/worst",
-            "outtmpl": os.path.join(tmpdir, "v.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "nocheckcertificate": True,
-        }
+        ydl_opts = {**_YT_OPTS, "format": "bestvideo[height<=360][ext=mp4]/bestvideo[height<=360]/worst",
+                    "outtmpl": os.path.join(tmpdir, "v.%(ext)s")}
         if cookiefile and os.path.exists(cookiefile):
             ydl_opts["cookiefile"] = cookiefile
         try:
@@ -532,51 +532,71 @@ def save_seen(seen: set) -> None:
 
 
 def fetch_feed() -> list[dict]:
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "playlistend": 15,
-        "extract_flat": False,
-    }
+    """RSS로 최신 영상 목록 수집 (GitHub Actions에서 항상 작동, 봇 감지 없음)."""
+    rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(CHANNEL_URL, download=False)
-        entries = info.get("entries") or []
-        print(f"full 추출 성공 ({len(entries)}개)")
+        resp = requests.get(rss_url, timeout=15,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
     except Exception as e:
-        print(f"full 추출 실패 ({e}), flat으로 재시도...")
-        flat_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-            "playlistend": 15,
-        }
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+        print(f"RSS 실패 ({e}), yt-dlp flat으로 재시도...")
+        return _fetch_feed_ytdlp()
+
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "yt": "http://www.youtube.com/xml/schemas/2015",
+        "media": "http://search.yahoo.com/mrss/",
+    }
+    videos = []
+    for entry in root.findall("atom:entry", ns):
+        video_id = entry.findtext("yt:videoId", "", ns)
+        if not video_id:
+            continue
+        title = entry.findtext("atom:title", "", ns) or ""
+        published = entry.findtext("atom:published", "", ns) or ""
+        desc = (entry.findtext(".//media:description", "", ns) or "").strip()
+        print(f"  [{title[:30]}] desc={len(desc)}자")
+        videos.append({
+            "id": video_id,
+            "title": title,
+            "link": f"https://www.youtube.com/watch?v={video_id}",
+            "published": published,
+            "description": desc,
+            "chapters": [],
+            "subtitle_urls": [],
+            "storyboard_spec": "",
+            "storyboard_info": {},
+        })
+    print(f"RSS 추출 성공 ({len(videos)}개)")
+    return videos[:15]
+
+
+def _fetch_feed_ytdlp() -> list[dict]:
+    """yt-dlp flat으로 채널 영상 목록 수집 (RSS 실패 시 fallback)."""
+    opts = {**_YT_OPTS, "skip_download": True, "extract_flat": True, "playlistend": 15}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(CHANNEL_URL, download=False)
         entries = info.get("entries") or []
-
-    videos = []
-    for entry in entries:
-        if not entry:
-            continue
-        chapters = entry.get("chapters") or []
-        sub_urls = _extract_sub_urls(entry)
-        desc = entry.get("description", "") or ""
-        sb_info = _extract_storyboard_from_ytdlp(entry) if entry.get("formats") else {}
-        print(f"  [{entry.get('title', '')[:25]}] desc={len(desc)}자 chapters={len(chapters)} sb={'있음' if sb_info else '없음'}")
-        videos.append({
-            "id": entry["id"],
-            "title": entry.get("title", ""),
-            "link": f"https://www.youtube.com/watch?v={entry['id']}",
-            "published": _date_to_iso(entry.get("upload_date", "")),
-            "description": desc,
-            "chapters": chapters,
-            "subtitle_urls": sub_urls,
+        print(f"yt-dlp flat 성공 ({len(entries)}개)")
+    except Exception as e:
+        print(f"yt-dlp flat 실패: {e}")
+        return []
+    return [
+        {
+            "id": e["id"],
+            "title": e.get("title", ""),
+            "link": f"https://www.youtube.com/watch?v={e['id']}",
+            "published": _date_to_iso(e.get("upload_date", "")),
+            "description": "",
+            "chapters": [],
+            "subtitle_urls": [],
             "storyboard_spec": "",
-            "storyboard_info": sb_info,
-        })
-    return videos
+            "storyboard_info": {},
+        }
+        for e in entries if e
+    ]
 
 
 def fetch_transcript(video: dict) -> dict:
