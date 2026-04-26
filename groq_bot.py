@@ -72,6 +72,7 @@ def setup_cookies() -> str | None:
             _COOKIE_TMPFILE = path
             atexit.register(cleanup_cookies)
             print(f"[쿠키] YOUTUBE_COOKIES_B64 → 임시 파일 복원 ({len(data):,} bytes): {path}")
+            _log_cookie_info(path)
             return path
         except Exception as e:
             print(f"[쿠키] base64 복원 실패: {e}")
@@ -87,6 +88,18 @@ def setup_cookies() -> str | None:
 
     print("[쿠키] 쿠키 없음 — GitHub Actions에서는 봇 감지 차단 가능")
     return None
+
+
+def _log_cookie_info(path: str) -> None:
+    try:
+        with open(path) as f:
+            lines = [l for l in f if not l.startswith("#") and "\t" in l]
+        domains = sorted({l.split("\t")[0] for l in lines})
+        names = sorted({l.split("\t")[5] for l in lines if len(l.split("\t")) > 5})
+        print(f"  [쿠키 확인] {len(lines)}개 / 도메인: {', '.join(domains)}")
+        print(f"  [쿠키 이름] {', '.join(names[:15])}{'...' if len(names) > 15 else ''}")
+    except Exception as e:
+        print(f"  [쿠키 확인 실패] {e}")
 
 
 def cleanup_cookies() -> None:
@@ -139,7 +152,7 @@ def download_video(video_id: str, output_path: str, cookiefile: str | None) -> b
     opts = {
         **_YDL_BASE_OPTS,
         "format": "worstvideo[ext=mp4]/worst[ext=mp4]/worstvideo/worst",
-        "extractor_args": {"youtube": {"player_client": ["tv"]}},
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
         "outtmpl": output_path,
     }
     if cookiefile:
