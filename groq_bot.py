@@ -138,7 +138,7 @@ def fetch_feed() -> list[dict]:
 def download_video(video_id: str, output_path: str, cookiefile: str | None) -> bool:
     opts = {
         **_YDL_BASE_OPTS,
-        "format": "worstvideo[ext=mp4]/worstvideo",
+        "format": "worstvideo[ext=mp4]/worst[ext=mp4]/worstvideo/worst",
         "outtmpl": output_path,
     }
     if cookiefile:
