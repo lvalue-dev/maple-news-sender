@@ -63,7 +63,6 @@ def download_video(video_id: str, output_path: str) -> bool:
         "outtmpl": output_path,
         "quiet": False,  # 다운로드 포맷/해상도 확인용
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     if os.path.exists("cookies.txt"):
         ydl_opts["cookiefile"] = "cookies.txt"
