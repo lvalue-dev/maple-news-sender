@@ -33,20 +33,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Setup YouTube cookies (optional)
-        run: |
-          if [ -n "$YOUTUBE_COOKIES_B64" ]; then
-            echo "$YOUTUBE_COOKIES_B64" | base64 -d > cookies.txt
-            echo "쿠키 파일 생성됨"
-          fi
-        env:
-          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
-
       - name: Run notifier
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python main.py
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+        run: python groq_bot.py
 
       - name: Commit seen_videos.json
         run: |

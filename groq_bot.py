@@ -1,12 +1,12 @@
 import atexit
 import base64
+import json
 import os
 import re
-import sys
 import tempfile
 import time
-from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import easyocr
@@ -15,6 +15,7 @@ import requests
 import yt_dlp
 from groq import BadRequestError, Groq
 
+# ── 환경변수 ──────────────────────────────────────────────
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "UC1dHu9GhbHH7RcHKyJdaOvA").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 GROQ_FALLBACK_MODELS = [
@@ -25,17 +26,40 @@ GROQ_FALLBACK_MODELS = [
     if m.strip()
 ]
 FRAME_INTERVAL_SECONDS = int(os.environ.get("FRAME_INTERVAL_SECONDS", "3"))
-
-MONTH_KR = {
-    1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월", 6: "6월",
-    7: "7월", 8: "8월", 9: "9월", 10: "10월", 11: "11월", 12: "12월",
-}
+SEEN_FILE = Path("seen_videos.json")
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+")
 _COOKIE_TMPFILE: str | None = None
 
+_YDL_BASE_OPTS = {
+    "quiet": False,
+    "no_warnings": True,
+    "retries": 5,
+    "extractor_retries": 3,
+    "fragment_retries": 5,
+    "sleep_interval": 2,
+    "max_sleep_interval": 5,
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+    },
+}
+
+
+# ── 쿠키 관리 ─────────────────────────────────────────────
 
 def setup_cookies() -> str | None:
+    """
+    우선순위:
+      1. YOUTUBE_COOKIES_B64 (base64) → 임시 파일 복원
+      2. YOUTUBE_COOKIES_FILE (절대/상대 경로)
+      3. 작업 디렉터리의 cookies.txt
+    반환값: 쿠키 파일 경로 or None
+    """
     global _COOKIE_TMPFILE
 
     b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
@@ -76,6 +100,18 @@ def cleanup_cookies() -> None:
         _COOKIE_TMPFILE = None
 
 
+# ── 피드 ──────────────────────────────────────────────────
+
+def load_seen() -> set:
+    if SEEN_FILE.exists():
+        return set(json.loads(SEEN_FILE.read_text()))
+    return set()
+
+
+def save_seen(seen: set) -> None:
+    SEEN_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2))
+
+
 def fetch_feed() -> list[dict]:
     rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
     feed = feedparser.parse(rss_url)
@@ -87,33 +123,23 @@ def fetch_feed() -> list[dict]:
             video_id = eid.split(":")[-1] if ":" in eid else ""
         if not video_id:
             continue
-        title = entry.get("title", "")
-        link = entry.get("link", f"https://www.youtube.com/watch?v={video_id}")
-        published = entry.get("published", datetime.now().isoformat())
-        videos.append({"id": video_id, "title": title, "link": link, "published": published})
-    print(f"RSS 추출 성공 ({len(videos)}개)")
-    return videos
+        videos.append({
+            "id": video_id,
+            "title": entry.get("title", ""),
+            "link": entry.get("link", f"https://www.youtube.com/watch?v={video_id}"),
+            "published": entry.get("published", datetime.now().isoformat()),
+        })
+    print(f"[RSS] {len(videos)}개 영상 수집")
+    return videos[:15]
 
+
+# ── 영상 다운로드 + OCR ────────────────────────────────────
 
 def download_video(video_id: str, output_path: str, cookiefile: str | None) -> bool:
     opts = {
+        **_YDL_BASE_OPTS,
         "format": "worstvideo[ext=mp4]/worstvideo",
         "outtmpl": output_path,
-        "quiet": False,
-        "no_warnings": True,
-        "retries": 5,
-        "extractor_retries": 3,
-        "fragment_retries": 5,
-        "sleep_interval": 2,
-        "max_sleep_interval": 5,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-        },
     }
     if cookiefile:
         opts["cookiefile"] = cookiefile
@@ -129,6 +155,8 @@ def download_video(video_id: str, output_path: str, cookiefile: str | None) -> b
                 f"  [봇 감지] {video_id}: 쿠키가 없거나 만료됨. "
                 "YOUTUBE_COOKIES_B64 시크릿을 확인하세요."
             )
+        elif "HTTP Error 429" in err or "rate" in err.lower():
+            print(f"  [레이트 리밋] {video_id}: YouTube 요청 한도 초과")
         else:
             print(f"  [다운로드 실패] {video_id}: {type(e).__name__}: {err[:300]}")
         return False
@@ -139,36 +167,36 @@ def extract_text_from_video(video_path: str, reader) -> str:
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"  영상 정보: {src_w}x{src_h} / {fps:.1f}fps / 총 {total_frames}프레임 ({total_frames/fps:.0f}초)")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"  [영상] {src_w}x{src_h} / {fps:.1f}fps / {total}프레임 ({total/fps:.0f}초)")
 
     sample_every = max(1, int(fps * FRAME_INTERVAL_SECONDS))
-    extracted_texts = []
-    last_text = ""
-    count = 0
+    extracted, last_text, count = [], "", 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         if count % sample_every == 0:
-            frame_resized = cv2.resize(frame, (640, 360))
-            result = reader.readtext(frame_resized, detail=0)
-            current_text = " ".join(result).strip()
-            current_text = _URL_RE.sub("", current_text).strip()
-            if current_text and current_text != last_text and re.search(r"[가-힣]", current_text):
-                extracted_texts.append(current_text)
-                last_text = current_text
+            resized = cv2.resize(frame, (640, 360))
+            result = reader.readtext(resized, detail=0)
+            text = _URL_RE.sub("", " ".join(result)).strip()
+            if text and text != last_text and re.search(r"[가-힣]", text):
+                extracted.append(text)
+                last_text = text
         count += 1
     cap.release()
-    print(f"  영상 OCR {len(extracted_texts)}개 블록")
-    # 실제 추출된 텍스트 전체 출력 (AI에 전달되는 내용 확인)
-    if extracted_texts:
-        print("  ---- OCR 추출 텍스트 시작 ----")
-        for i, t in enumerate(extracted_texts):
-            print(f"  [{i+1}] {t}")
-        print("  ---- OCR 추출 텍스트 끝 ----")
-    return "\n".join(extracted_texts)
 
+    print(f"  [OCR] {len(extracted)}개 블록 추출")
+    if extracted:
+        print("  ---- OCR 텍스트 시작 ----")
+        for i, t in enumerate(extracted):
+            print(f"  [{i+1}] {t}")
+        print("  ---- OCR 텍스트 끝 ----")
+    return "\n".join(extracted)
+
+
+# ── Groq 요약 ──────────────────────────────────────────────
 
 def summarize(title: str, text: str, client: Groq) -> str:
     if text.strip():
@@ -197,46 +225,37 @@ def summarize(title: str, text: str, client: Groq) -> str:
         prompt = (
             "너는 메이플스토리 소식 전달 비서야.\n"
             f"영상 제목: {title}\n"
-            "영상에서 텍스트를 추출하지 못했다. 제목에 명시된 내용만 불렛으로 정리해. 추측이나 창작 금지.\n"
-            "한글만 사용. URL 절대 금지."
+            "영상에서 텍스트를 추출하지 못했다. 제목에 명시된 내용만 불렛으로 정리해. "
+            "추측이나 창작 금지. 한글만 사용. URL 절대 금지."
         )
 
-    models_to_try = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
-    last_error = None
-    for model_name in models_to_try:
+    models = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
+    last_err = None
+    for model in models:
         for attempt in range(3):
             try:
-                completion = client.chat.completions.create(
-                    model=model_name,
+                resp = client.chat.completions.create(
+                    model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
                 )
-                return completion.choices[0].message.content or ""
+                return resp.choices[0].message.content or ""
             except BadRequestError as e:
                 if "model_decommissioned" in str(e):
-                    last_error = e
+                    last_err = e
                     break
                 raise
             except Exception as e:
                 if "429" in str(e) or "rate_limit" in str(e).lower():
                     wait = 30 * (attempt + 1)
-                    print(f"  Rate limit, {wait}초 대기 후 재시도...")
+                    print(f"  [Groq] Rate limit — {wait}초 대기")
                     time.sleep(wait)
                     continue
                 raise
-    raise last_error or RuntimeError("No model available")
+    raise last_err or RuntimeError("Groq: 사용 가능한 모델 없음")
 
 
-def send_month_header(month: int, count: int) -> None:
-    webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
-    payload = {
-        "embeds": [{
-            "title": f"2026년 {MONTH_KR[month]} - 영상 {count}개",
-            "color": 0x5865F2,
-        }]
-    }
-    requests.post(webhook_url, json=payload, timeout=15).raise_for_status()
-
+# ── Discord 전송 ───────────────────────────────────────────
 
 def send_discord(video: dict, summary: str) -> None:
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
@@ -250,56 +269,47 @@ def send_discord(video: dict, summary: str) -> None:
         "url": video["link"],
         "description": summary,
         "color": 0xA020F0,
-        "footer": {"text": published_dt.strftime("%Y-%m-%d")},
+        "footer": {"text": f"업로드: {published_dt.strftime('%Y-%m-%d')}"},
         "thumbnail": {"url": f"https://img.youtube.com/vi/{video['id']}/hqdefault.jpg"},
     }
     requests.post(webhook_url, json={"embeds": [embed]}, timeout=15).raise_for_status()
 
 
+# ── 메인 ──────────────────────────────────────────────────
+
 def main() -> None:
     cookiefile = setup_cookies()
 
-    print("채널 영상 목록 가져오는 중...")
+    seen = load_seen()
     videos = fetch_feed()
+    new_videos = [v for v in videos if v["id"] not in seen]
 
-    if not videos:
-        print("영상을 가져오지 못했습니다.")
-        sys.exit(1)
+    if not new_videos:
+        print("새 영상 없음")
+        return
 
-    print(f"총 {len(videos)}개 영상 발견")
-
+    print(f"새 영상 {len(new_videos)}개 처리 시작")
     reader = easyocr.Reader(["ko", "en"], verbose=False)
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-    by_month: dict[tuple, list] = defaultdict(list)
-    for v in sorted(videos, key=lambda x: x["published"]):
-        dt = datetime.fromisoformat(v["published"])
-        by_month[(dt.year, dt.month)].append(v)
+    for video in reversed(new_videos):
+        print(f"\n처리 중: {video['title']}")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                video_path = os.path.join(tmpdir, "video.mp4")
+                if download_video(video["id"], video_path, cookiefile) and os.path.exists(video_path):
+                    text = extract_text_from_video(video_path, reader)
+                else:
+                    text = ""
+            summary = summarize(video["title"], text, client)
+            send_discord(video, summary)
+            seen.add(video["id"])
+            print(f"  전송 완료: {video['title']}")
+        except Exception as e:
+            print(f"  [오류] {video['title']}: {type(e).__name__}: {e}")
+            # 실패한 영상은 seen에 추가하지 않아 다음 실행 시 재시도
 
-    for (year, month) in sorted(by_month.keys()):
-        month_videos = by_month[(year, month)]
-        print(f"\n[{year}년 {MONTH_KR[month]}] {len(month_videos)}개")
-
-        send_month_header(month, len(month_videos))
-        time.sleep(1)
-
-        for video in month_videos:
-            print(f"처리 중: {video['title']}")
-            try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    video_path = os.path.join(tmpdir, "video.mp4")
-                    if download_video(video["id"], video_path, cookiefile) and os.path.exists(video_path):
-                        text = extract_text_from_video(video_path, reader)
-                    else:
-                        text = ""
-                summary = summarize(video["title"], text, client)
-                send_discord(video, summary)
-                print(f"  전송 완료")
-            except Exception as e:
-                print(f"  [오류] {video['title']}: {type(e).__name__}: {e}")
-            time.sleep(1)
-
-    print("\n모든 전송 완료!")
+    save_seen(seen)
     cleanup_cookies()
 
 
