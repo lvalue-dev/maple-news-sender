@@ -1,708 +1,145 @@
-import http.cookiejar
-import io
-import math
 import os
-import json
 import re
 import sys
+import tempfile
 import time
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
 
+import cv2
+import easyocr
+import feedparser
 import requests
 import yt_dlp
-from groq import Groq
-from PIL import Image, ImageEnhance
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import NoTranscriptFound
+from groq import BadRequestError, Groq
 
-CHANNEL_ID = "UC1dHu9GhbHH7RcHKyJdaOvA"
-CHANNEL_URL = f"https://www.youtube.com/channel/{CHANNEL_ID}/videos"
-MONTH_KR = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
-            7:"7월",8:"8월",9:"9월",10:"10월",11:"11월",12:"12월"}
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "UC1dHu9GhbHH7RcHKyJdaOvA").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GROQ_FALLBACK_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant"
+    ).split(",")
+    if m.strip()
+]
+FRAME_INTERVAL_SECONDS = int(os.environ.get("FRAME_INTERVAL_SECONDS", "3"))
 
-_YT_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "nocheckcertificate": True,
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+MONTH_KR = {
+    1: "1월", 2: "2월", 3: "3월", 4: "4월", 5: "5월", 6: "6월",
+    7: "7월", 8: "8월", 9: "9월", 10: "10월", 11: "11월", 12: "12월",
 }
 
-_CJK_RE = re.compile(
-    r'[぀-ヿ'
-    r'㐀-䶿'
-    r'一-鿿'
-    r'豈-﫿]'
-)
-_URL_RE = re.compile(r'https?://\S+|www\.\S+')
-
-
-def _strip_cjk(text: str) -> str:
-    return _CJK_RE.sub('', text)
-
-
-def _clean_text(text: str) -> str:
-    text = _URL_RE.sub('', text)
-    lines = [l.rstrip() for l in text.splitlines()]
-    result, prev_blank = [], False
-    for l in lines:
-        blank = l.strip() == ''
-        if blank and prev_blank:
-            continue
-        result.append(l)
-        prev_blank = blank
-    return '\n'.join(result).strip()
-
-
-def _date_to_iso(upload_date: str) -> str:
-    if not upload_date or len(upload_date) < 8:
-        return datetime.now().strftime("%Y-%m-%dT00:00:00+00:00")
-    return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}T00:00:00+00:00"
-
-
-def _format_transcript(entries: list) -> str:
-    groups: dict[int, list[str]] = {}
-    for t in entries:
-        text = t["text"].strip()
-        if len(text) < 4 or not re.search(r'[가-힣a-zA-Z0-9]', text):
-            continue
-        bucket = int(t["start"] // 30) * 30
-        groups.setdefault(bucket, []).append(text)
-    lines = []
-    for sec in sorted(groups):
-        m, s = divmod(sec, 60)
-        lines.append(f"[{m:02d}:{s:02d}] {' '.join(groups[sec])}")
-    return "\n".join(lines)
-
-
-def _format_chapters(chapters: list) -> str:
-    lines = []
-    for ch in chapters or []:
-        start = int(ch.get("start_time", 0))
-        end = ch.get("end_time")
-        title = ch.get("title", "").strip()
-        if not title or title.startswith("<Untitled"):
-            continue
-        m_s, s_s = divmod(start, 60)
-        suffix = f"~{int(end) // 60:02d}:{int(end) % 60:02d}" if end else ""
-        lines.append(f"[{m_s:02d}:{s_s:02d}{suffix}] {title}")
-    return "\n".join(lines)
-
-
-def _parse_desc_timestamps(description: str) -> str:
-    if not description:
-        return ""
-    ts_re = re.compile(
-        r'^(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)$'
-        r'|^(.+?)\s+(\d{1,2}:\d{2}(?::\d{2})?)$',
-        re.MULTILINE
-    )
-    lines = []
-    for m in ts_re.finditer(description):
-        if m.group(1):
-            ts, title = m.group(1), m.group(2).strip()
-        else:
-            ts, title = m.group(4), m.group(3).strip()
-        if title:
-            lines.append(f"[{ts}] {title}")
-    return "\n".join(lines)
-
-
-def _extract_sub_urls(entry: dict) -> list:
-    subs = entry.get("subtitles") or {}
-    auto = entry.get("automatic_captions") or {}
-    for lang in ("ko", "ko-KR"):
-        if lang in subs:
-            return subs[lang]
-    for lang in ("ko", "a.ko", "a-ko"):
-        if lang in auto:
-            return auto[lang]
-    return []
-
-
-def _parse_vtt(vtt_text: str) -> str:
-    entries = []
-    pattern = re.compile(
-        r'(\d+:\d+:\d+\.\d+|\d+:\d+\.\d+)\s*-->.*\n((?:(?!-->).+\n?)*)',
-        re.MULTILINE
-    )
-    for m in pattern.finditer(vtt_text):
-        ts = m.group(1)
-        parts = ts.split(":")
-        start = (
-            float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-            if len(parts) == 3
-            else float(parts[0]) * 60 + float(parts[1])
-        )
-        text = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-        if text and len(text) >= 4:
-            entries.append({"start": start, "text": text})
-    return _format_transcript(entries)
-
-
-def _fetch_subtitle_content(sub_urls: list, cookiefile: str = None) -> str:
-    if not sub_urls:
-        return ""
-    url_entry = next((s for s in sub_urls if s.get("ext") == "vtt"), sub_urls[0])
-    url = url_entry.get("url", "")
-    if not url:
-        return ""
-    ydl_opts = {"quiet": True, "no_warnings": True}
-    if cookiefile:
-        ydl_opts["cookiefile"] = cookiefile
-    try:
-        from yt_dlp.networking.common import Request
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            data = ydl.urlopen(Request(url)).read().decode("utf-8")
-            return _parse_vtt(data)
-    except Exception as e:
-        print(f"  자막 URL 실패: {type(e).__name__}")
-        return ""
-
-
-def _fetch_manual_transcript(video_id: str) -> str:
-    try:
-        transcript_list = YouTubeTranscriptApi().list(video_id)
-        transcript = transcript_list.find_manually_created_transcript(["ko", "ko-KR"])
-        entries = transcript.fetch()
-        text = _format_transcript(entries)
-        if text.strip():
-            print(f"  수동 자막 {len(text)}자")
-            return text
-    except NoTranscriptFound:
-        print("  수동 자막 없음 (ASR만 존재 -> 건너뜀)")
-    except Exception as e:
-        print(f"  자막 API 실패: {type(e).__name__}: {e}")
-    return ""
-
-
-def _scrape_video_info(video_id: str, cookiefile: str = None) -> dict:
-    session = requests.Session()
-    if cookiefile and os.path.exists(cookiefile):
-        jar = http.cookiejar.MozillaCookieJar()
-        try:
-            jar.load(cookiefile, ignore_discard=True, ignore_expires=True)
-            session.cookies = jar
-            print(f"  쿠키 {sum(1 for _ in jar)}개 적용")
-        except Exception as e:
-            print(f"  쿠키 로드 실패: {e}")
-    try:
-        resp = session.get(
-            f"https://www.youtube.com/watch?v={video_id}",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Upgrade-Insecure-Requests": "1",
-            },
-            timeout=15,
-        )
-        match = re.search(r'ytInitialPlayerResponse\s*=\s*', resp.text)
-        if match:
-            data, _ = json.JSONDecoder().raw_decode(resp.text, match.end())
-            play_status = data.get("playabilityStatus", {}).get("status", "")
-            desc = data.get("videoDetails", {}).get("shortDescription", "")
-            spec = (data.get("storyboards", {})
-                        .get("playerStoryboardSpecRenderer", {})
-                        .get("spec", ""))
-            print(f"  페이지 스크래핑 status={play_status} desc={len(desc)}자 spec={'있음' if spec else '없음'}")
-            if play_status == "OK":
-                return {"description": desc, "storyboard_spec": spec}
-            else:
-                print(f"  -> 접근 제한 (쿠키 필요 또는 만료)")
-        else:
-            print(f"  페이지 스크래핑: ytInitialPlayerResponse 없음 (HTTP {resp.status_code})")
-    except Exception as e:
-        print(f"  페이지 스크래핑 실패: {type(e).__name__}: {e}")
-    return {"description": "", "storyboard_spec": ""}
-
-
-def _fetch_video_details_ytdlp(video_id: str, cookiefile: str = None) -> dict:
-    opts = {**_YT_OPTS, "skip_download": True}
-    if cookiefile and os.path.exists(cookiefile):
-        opts["cookiefile"] = cookiefile
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(
-                f"https://www.youtube.com/watch?v={video_id}",
-                download=False,
-            )
-        desc = info.get("description", "") or ""
-        chapters = info.get("chapters") or []
-        sub_urls = _extract_sub_urls(info)
-        sb_info = _extract_storyboard_from_ytdlp(info)
-        print(f"  yt-dlp desc={len(desc)}자 chapters={len(chapters)} subs={len(sub_urls)} sb={'있음' if sb_info else '없음'}")
-        return {"description": desc, "chapters": chapters, "subtitle_urls": sub_urls, "storyboard_info": sb_info}
-    except Exception as e:
-        print(f"  yt-dlp 개별 추출 실패: {type(e).__name__}: {e}")
-        return {}
-
-
-def _parse_storyboard(spec: str) -> list[dict]:
-    if not spec:
-        return []
-    parts = spec.split("|")
-    base_url = parts[0]
-    levels = []
-    for level_idx, params_str in enumerate(parts[1:]):
-        p = params_str.split("#")
-        if len(p) < 6:
-            continue
-        try:
-            w, h, count, interval_ms, cols, rows = (
-                int(p[0]), int(p[1]), int(p[2]), int(p[3]), int(p[4]), int(p[5])
-            )
-        except ValueError:
-            continue
-        sigh = p[6] if len(p) > 6 else ""
-        sheet_url_base = base_url.replace("$L", str(level_idx)).replace("$N", sigh)
-        sheets_needed = math.ceil(count / (cols * rows))
-        levels.append({
-            "width": w, "height": h, "count": count,
-            "interval_ms": interval_ms, "cols": cols, "rows": rows,
-            "sheet_url_base": sheet_url_base,
-            "sheets_needed": sheets_needed,
-        })
-    return sorted(levels, key=lambda x: x["width"], reverse=True)
-
-
-def _run_easyocr(img: Image.Image, reader) -> str:
-    result = reader.readtext(img, detail=0, paragraph=True,
-                             text_threshold=0.5, low_text=0.3)
-    text = " ".join(result).strip()
-    text = _strip_cjk(text)
-    text = _URL_RE.sub("", text).strip()
-    return text if re.search(r'[가-힣]', text) else ""
-
-
-def _ocr_thumbnail(video_id: str, reader) -> str:
-    for quality in ("maxresdefault", "sddefault", "hqdefault"):
-        url = f"https://img.youtube.com/vi/{video_id}/{quality}.jpg"
-        try:
-            img_bytes = requests.get(url, timeout=10).content
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            if img.width < 300:
-                continue
-            img = ImageEnhance.Contrast(img).enhance(1.3)
-            text = _run_easyocr(img, reader)
-            if text:
-                print(f"  썸네일 OCR ({quality}) {len(text)}자")
-                return text
-        except Exception:
-            continue
-    return ""
-
-
-def _ocr_storyboard(spec: str, reader) -> str:
-    levels = _parse_storyboard(spec)
-    if not levels:
-        return ""
-    best = next((l for l in levels if l["width"] >= 240), None)
-    if not best:
-        return ""
-
-    interval_sec = best["interval_ms"] / 1000
-    cols, rows = best["cols"], best["rows"]
-    frame_w, frame_h = best["width"], best["height"]
-    seen_texts: set[str] = set()
-    results: list[tuple[float, str]] = []
-    frame_global_idx = 0
-
-    for sheet_idx in range(best["sheets_needed"]):
-        url = best["sheet_url_base"] + f"M{sheet_idx}.jpg"
-        try:
-            img_bytes = requests.get(url, timeout=10).content
-            sheet = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        except Exception:
-            frame_global_idx += cols * rows
-            continue
-
-        for r in range(rows):
-            for c in range(cols):
-                if frame_global_idx >= best["count"]:
-                    break
-                timestamp = frame_global_idx * interval_sec
-                frame = sheet.crop((
-                    c * frame_w, r * frame_h,
-                    (c + 1) * frame_w, (r + 1) * frame_h,
-                ))
-                frame = frame.resize((frame_w * 4, frame_h * 4), Image.LANCZOS)
-                frame = ImageEnhance.Contrast(frame).enhance(1.5)
-                text = _run_easyocr(frame, reader)
-                if text and text not in seen_texts:
-                    seen_texts.add(text)
-                    m, s = divmod(int(timestamp), 60)
-                    results.append((timestamp, f"[{m:02d}:{s:02d}] {text}"))
-                frame_global_idx += 1
-
-    if not results:
-        return ""
-    results.sort(key=lambda x: x[0])
-    print(f"  스토리보드 OCR {len(results)}개 블록")
-    return "\n".join(t for _, t in results)
-
-
-def _extract_storyboard_from_ytdlp(info: dict) -> dict:
-    """yt-dlp info의 formats에서 스토리보드 fragment URL 추출."""
-    formats = info.get("formats") or []
-    sb_formats = [
-        f for f in formats
-        if (f.get("format_id") or "").startswith("sb")
-        and f.get("width")
-        and f.get("fragments")
-    ]
-    if not sb_formats:
-        return {}
-    sb_formats.sort(key=lambda f: f.get("width", 0), reverse=True)
-    best = next((f for f in sb_formats if (f.get("width") or 0) >= 240), sb_formats[0])
-    cols = best.get("columns") or best.get("cols") or 5
-    rows = best.get("rows") or 5
-    return {
-        "width": best.get("width", 0),
-        "height": best.get("height", 0),
-        "cols": cols,
-        "rows": rows,
-        "fragments": best.get("fragments", []),
-    }
-
-
-def _ocr_storyboard_fragments(sb_info: dict, reader) -> str:
-    """yt-dlp fragment URL 목록으로 스토리보드 OCR."""
-    if not sb_info or not sb_info.get("fragments"):
-        return ""
-    frame_w = sb_info["width"]
-    frame_h = sb_info["height"]
-    cols = sb_info["cols"]
-    rows = sb_info["rows"]
-    seen_texts: set[str] = set()
-    results: list[tuple[float, str]] = []
-    elapsed = 0.0
-
-    for frag in sb_info["fragments"]:
-        url = frag.get("url", "")
-        frag_dur = frag.get("duration") or 0
-        if not url:
-            elapsed += frag_dur
-            continue
-        try:
-            img_bytes = requests.get(url, timeout=15).content
-            sheet = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        except Exception:
-            elapsed += frag_dur
-            continue
-
-        frames_in_sheet = cols * rows
-        frame_dur = frag_dur / frames_in_sheet if frames_in_sheet else 1
-        for r in range(rows):
-            for c in range(cols):
-                frame = sheet.crop((
-                    c * frame_w, r * frame_h,
-                    (c + 1) * frame_w, (r + 1) * frame_h,
-                ))
-                frame = frame.resize((frame_w * 4, frame_h * 4), Image.LANCZOS)
-                frame = ImageEnhance.Contrast(frame).enhance(1.5)
-                text = _run_easyocr(frame, reader)
-                if text and text not in seen_texts:
-                    seen_texts.add(text)
-                    ts = elapsed + (r * cols + c) * frame_dur
-                    m, s = divmod(int(ts), 60)
-                    results.append((ts, f"[{m:02d}:{s:02d}] {text}"))
-        elapsed += frag_dur
-
-    if not results:
-        return ""
-    results.sort(key=lambda x: x[0])
-    print(f"  스토리보드 OCR (fragments) {len(results)}개 블록")
-    return "\n".join(t for _, t in results)
-
-
-def _ocr_video_frames(video_id: str, reader, cookiefile: str = None) -> str:
-    """저화질 영상 다운로드 + FFmpeg 프레임 추출 + OCR (스토리보드 실패 시 fallback)."""
-    import subprocess
-    import glob
-    import tempfile
-
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
-    except Exception:
-        print("  FFmpeg 없음, 영상 직접 OCR 건너뜀")
-        return ""
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ydl_opts = {**_YT_OPTS, "format": "bestvideo[height<=360][ext=mp4]/bestvideo[height<=360]/worst",
-                    "outtmpl": os.path.join(tmpdir, "v.%(ext)s")}
-        if cookiefile and os.path.exists(cookiefile):
-            ydl_opts["cookiefile"] = cookiefile
-        try:
-            from yt_dlp.utils import download_range_func
-            ydl_opts["download_ranges"] = download_range_func(None, [(0, 300)])
-            ydl_opts["force_keyframes_at_cuts"] = True
-        except (ImportError, AttributeError):
-            pass
-
-        print(f"  영상 저화질 다운로드 중 (최대 5분)...")
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-        except Exception as e:
-            print(f"  영상 다운로드 실패: {type(e).__name__}")
-            return ""
-
-        files = glob.glob(os.path.join(tmpdir, "v.*"))
-        if not files:
-            return ""
-
-        frames_dir = os.path.join(tmpdir, "f")
-        os.makedirs(frames_dir)
-        ret = subprocess.run(
-            ["ffmpeg", "-i", files[0], "-vf", "fps=1/5",
-             os.path.join(frames_dir, "%05d.jpg"),
-             "-q:v", "3", "-loglevel", "error"],
-            capture_output=True, timeout=180,
-        )
-        if ret.returncode != 0:
-            print("  FFmpeg 프레임 추출 실패")
-            return ""
-
-        frame_files = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
-        if not frame_files:
-            return ""
-
-        seen_texts: set[str] = set()
-        results: list[tuple[int, str]] = []
-
-        for i, fpath in enumerate(frame_files):
-            timestamp = i * 5
-            try:
-                img = Image.open(fpath).convert("RGB")
-            except Exception:
-                continue
-            img = ImageEnhance.Contrast(img).enhance(1.3)
-            raw = reader.readtext(img, detail=0, paragraph=False,
-                                   text_threshold=0.4, low_text=0.3)
-            text = " ".join(raw).strip()
-            text = _strip_cjk(text)
-            text = _URL_RE.sub("", text).strip()
-            if text and re.search(r'[가-힣]', text) and text not in seen_texts:
-                seen_texts.add(text)
-                m, s = divmod(timestamp, 60)
-                results.append((timestamp, f"[{m:02d}:{s:02d}] {text}"))
-
-        if results:
-            print(f"  영상 직접 OCR {len(results)}개 블록")
-            return "\n".join(t for _, t in results)
-        return ""
-
-
-def _ocr_all(video_id: str, storyboard_spec: str, storyboard_info: dict = None, cookiefile: str = None) -> str:
-    try:
-        import easyocr
-        reader = easyocr.Reader(["ko", "en"], verbose=False)
-    except Exception as e:
-        print(f"  EasyOCR 초기화 실패: {e}")
-        return ""
-    thumb_text = _ocr_thumbnail(video_id, reader)
-    if storyboard_info:
-        sb_text = _ocr_storyboard_fragments(storyboard_info, reader)
-    else:
-        sb_text = _ocr_storyboard(storyboard_spec, reader)
-    if not sb_text:
-        sb_text = _ocr_video_frames(video_id, reader, cookiefile)
-    parts = []
-    if thumb_text:
-        parts.append(f"[썸네일] {thumb_text}")
-    if sb_text:
-        parts.append(sb_text)
-    return "\n".join(parts)
+_URL_RE = re.compile(r"https?://\S+|www\.\S+")
 
 
 def fetch_feed() -> list[dict]:
-    """RSS로 최신 영상 목록 수집 (GitHub Actions에서 항상 작동, 봇 감지 없음)."""
     rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL_ID}"
-    try:
-        resp = requests.get(rss_url, timeout=15,
-                            headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-    except Exception as e:
-        print(f"RSS 실패 ({e}), yt-dlp flat으로 재시도...")
-        return _fetch_feed_ytdlp()
-
-    ns = {
-        "atom": "http://www.w3.org/2005/Atom",
-        "yt": "http://www.youtube.com/xml/schemas/2015",
-        "media": "http://search.yahoo.com/mrss/",
-    }
+    feed = feedparser.parse(rss_url)
     videos = []
-    for entry in root.findall("atom:entry", ns):
-        video_id = entry.findtext("yt:videoId", "", ns)
+    for entry in feed.entries:
+        video_id = getattr(entry, "yt_videoid", "") or entry.get("yt_videoid", "")
+        if not video_id:
+            eid = entry.get("id", "")
+            video_id = eid.split(":")[-1] if ":" in eid else ""
         if not video_id:
             continue
-        title = entry.findtext("atom:title", "", ns) or ""
-        published = entry.findtext("atom:published", "", ns) or ""
-        desc = (entry.findtext(".//media:description", "", ns) or "").strip()
-        print(f"  [{title[:30]}] desc={len(desc)}자")
-        videos.append({
-            "id": video_id,
-            "title": title,
-            "link": f"https://www.youtube.com/watch?v={video_id}",
-            "published": published,
-            "description": desc,
-            "chapters": [],
-            "subtitle_urls": [],
-            "storyboard_spec": "",
-            "storyboard_info": {},
-        })
+        title = entry.get("title", "")
+        link = entry.get("link", f"https://www.youtube.com/watch?v={video_id}")
+        published = entry.get("published", datetime.now().isoformat())
+        videos.append({"id": video_id, "title": title, "link": link, "published": published})
     print(f"RSS 추출 성공 ({len(videos)}개)")
-    return videos[:15]
+    return videos
 
 
-def _fetch_feed_ytdlp() -> list[dict]:
-    """yt-dlp flat으로 채널 영상 목록 수집 (RSS 실패 시 fallback)."""
-    opts = {**_YT_OPTS, "skip_download": True, "extract_flat": True, "playlistend": 15}
+def download_video(video_id: str, output_path: str) -> bool:
+    ydl_opts = {
+        "format": "worstvideo[ext=mp4]/worstvideo",
+        "outtmpl": output_path,
+        "quiet": True,
+        "no_warnings": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(CHANNEL_URL, download=False)
-        entries = info.get("entries") or []
-        print(f"yt-dlp flat 성공 ({len(entries)}개)")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        return True
     except Exception as e:
-        print(f"yt-dlp flat 실패: {e}")
-        return []
-    return [
-        {
-            "id": e["id"],
-            "title": e.get("title", ""),
-            "link": f"https://www.youtube.com/watch?v={e['id']}",
-            "published": _date_to_iso(e.get("upload_date", "")),
-            "description": "",
-            "chapters": [],
-            "subtitle_urls": [],
-            "storyboard_spec": "",
-            "storyboard_info": {},
-        }
-        for e in entries if e
-    ]
+        print(f"  영상 다운로드 실패: {type(e).__name__}: {e}")
+        return False
 
 
-def fetch_transcript(video: dict) -> dict:
-    cookiefile = "cookies.txt" if os.path.exists("cookies.txt") else None
-    parts = []
-
-    desc = video.get("description", "").strip()
-    chapters = list(video.get("chapters") or [])
-    sub_urls = list(video.get("subtitle_urls") or [])
-    storyboard_spec = ""
-    storyboard_info = video.get("storyboard_info") or {}
-
-    # yt-dlp 개별 추출 (쿠키 없이도 공개 영상은 storyboard fragment URL 획득 가능)
-    detail = _fetch_video_details_ytdlp(video["id"], cookiefile)
-    if detail:
-        if len(detail.get("description", "")) > len(desc):
-            desc = detail["description"]
-        chapters = chapters or detail.get("chapters", [])
-        sub_urls = sub_urls or detail.get("subtitle_urls", [])
-        if not storyboard_info:
-            storyboard_info = detail.get("storyboard_info", {})
-
-    # 페이지 스크래핑 (storyboard 획득 실패 시 spec 방식 시도, 쿠키 필요)
-    if not storyboard_info:
-        scraped = _scrape_video_info(video["id"], cookiefile)
-        if len(scraped.get("description", "")) > len(desc):
-            desc = scraped["description"]
-        storyboard_spec = scraped.get("storyboard_spec", "")
-
-    cleaned_desc = _clean_text(desc)
-    if cleaned_desc:
-        parts.append("【영상 설명】\n" + cleaned_desc)
-
-    manual_text = _fetch_manual_transcript(video["id"])
-    if manual_text:
-        parts.append("【수동 자막】\n" + manual_text)
-
-    sub_text = _fetch_subtitle_content(sub_urls, cookiefile)
-    if sub_text:
-        parts.append("【자막】\n" + sub_text)
-        print(f"  자막 URL {len(sub_text)}자")
-
-    chapters_text = _format_chapters(chapters)
-    if chapters_text:
-        parts.append("【챕터】\n" + chapters_text)
-        print(f"  챕터 {len(chapters)}개 사용")
-    else:
-        desc_ts = _parse_desc_timestamps(desc)
-        if desc_ts:
-            parts.append("【설명 타임스탬프】\n" + desc_ts)
-            print(f"  설명 타임스탬프 {len(desc_ts)}자")
-
-    ocr_text = _ocr_all(video["id"], storyboard_spec, storyboard_info, cookiefile)
-    if ocr_text:
-        parts.append("【화면 텍스트(OCR)】\n" + ocr_text)
-
-    content = "\n\n".join(parts)
-    print(f"  최종 콘텐츠 {len(content)}자")
-    return {**video, "content": content[:15000]}
+def extract_text_from_video(video_path: str, reader) -> str:
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    sample_every = max(1, int(fps * FRAME_INTERVAL_SECONDS))
+    extracted_texts = []
+    last_text = ""
+    count = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if count % sample_every == 0:
+            frame_resized = cv2.resize(frame, (640, 360))
+            result = reader.readtext(frame_resized, detail=0)
+            current_text = " ".join(result).strip()
+            current_text = _URL_RE.sub("", current_text).strip()
+            if current_text and current_text != last_text and re.search(r"[가-힣]", current_text):
+                extracted_texts.append(current_text)
+                last_text = current_text
+        count += 1
+    cap.release()
+    print(f"  영상 OCR {len(extracted_texts)}개 블록")
+    return "\n".join(extracted_texts)
 
 
-def summarize(video: dict) -> str:
-    client = Groq(api_key=os.environ["GROQ_API_KEY"])
-    content = video.get("content", "").strip()
-
-    has_real_content = any(tag in content for tag in (
-        "【수동 자막】", "【자막】", "【챕터】",
-        "【화면 텍스트(OCR)】", "【설명 타임스탬프】",
-    )) or len(content) > 300
-
-    if has_real_content:
+def summarize(title: str, text: str, client: Groq) -> str:
+    if text.strip():
         prompt = (
-            "너는 메이플스토리 뉴스 요약 봇이야.\n"
-            "아래 영상 정보를 읽고 핵심 내용을 한국어로 요약해.\n\n"
-            "출력 형식:\n"
-            "타임스탬프가 있으면 -> 해당 시간대 주제 제목을 굵게\n"
-            "타임스탬프가 없으면 -> 주제 제목을 굵게\n"
-            "각 항목 아래에 세부 내용을 불렛으로 나열\n\n"
-            "규칙:\n"
-            "- 한글만 사용. 한자·일본어·중국어 절대 금지\n"
-            "- 날짜는 'X월 X일' 형식으로 정확히\n"
-            "- 보상 아이템·수량은 반드시 포함\n"
-            "- 출처에 없는 내용 작성 금지\n"
-            "- 추상적 표현 금지\n"
-            "- URL 포함 금지\n"
-            "- 내용이 없는 항목은 생략\n\n"
-            f"제목: {video['title']}\n\n"
-            f"{content}\n"
+            "너는 메이플스토리 소식 전달 비서야.\n"
+            f"영상 제목: {title}\n"
+            "아래는 영상에서 OCR로 추출된 텍스트다.\n"
+            "오타/중복이 있을 수 있으니 문맥을 정리해서 다음 형식으로 요약해줘.\n"
+            "1. 핵심 요약 (한 줄)\n"
+            "2. 상세 내용 (중요 조건/수치 위주 불렛 포인트)\n"
+            "3. 이벤트 기간 (없으면 생략)\n"
+            "규칙: 한글만 사용. URL 절대 금지. 출처에 없는 내용 추가 금지.\n"
+            f"텍스트:\n{text}"
         )
     else:
         prompt = (
-            "너는 메이플스토리 뉴스 요약 봇이야.\n"
-            "아래 영상 제목에 핵심 정보가 담겨 있다.\n"
-            "제목에 명시된 내용만 불렛으로 정리해. 추측이나 창작 금지.\n"
-            "한글만 사용. URL 절대 금지.\n\n"
-            f"제목: {video['title']}\n"
+            "너는 메이플스토리 소식 전달 비서야.\n"
+            f"영상 제목: {title}\n"
+            "영상에서 텍스트를 추출하지 못했다. 제목에 명시된 내용만 불렛으로 정리해. 추측이나 창작 금지.\n"
+            "한글만 사용. URL 절대 금지."
         )
 
-    for attempt in range(3):
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-            )
-            result = response.choices[0].message.content.strip()
-            result = _strip_cjk(result)
-            result = _URL_RE.sub('', result).strip()
-            return result
-        except Exception as e:
-            if "429" in str(e) or "rate_limit" in str(e).lower():
-                wait = 30 * (attempt + 1)
-                print(f"  Rate limit, {wait}초 대기 후 재시도...")
-                time.sleep(wait)
-            else:
+    models_to_try = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
+    last_error = None
+    for model_name in models_to_try:
+        for attempt in range(3):
+            try:
+                completion = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                )
+                return completion.choices[0].message.content or ""
+            except BadRequestError as e:
+                if "model_decommissioned" in str(e):
+                    last_error = e
+                    break
                 raise
-    raise RuntimeError("Groq API 재시도 초과")
+            except Exception as e:
+                if "429" in str(e) or "rate_limit" in str(e).lower():
+                    wait = 30 * (attempt + 1)
+                    print(f"  Rate limit, {wait}초 대기 후 재시도...")
+                    time.sleep(wait)
+                    continue
+                raise
+    raise last_error or RuntimeError("No model available")
 
 
 def send_month_header(month: int, count: int) -> None:
@@ -744,6 +181,9 @@ def main() -> None:
 
     print(f"총 {len(videos)}개 영상 발견")
 
+    reader = easyocr.Reader(["ko", "en"], verbose=False)
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
     by_month: dict[tuple, list] = defaultdict(list)
     for v in sorted(videos, key=lambda x: x["published"]):
         dt = datetime.fromisoformat(v["published"])
@@ -758,9 +198,14 @@ def main() -> None:
 
         for video in month_videos:
             print(f"처리 중: {video['title']}")
-            detailed = fetch_transcript(video)
-            summary = summarize(detailed)
-            send_discord(detailed, summary)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                video_path = os.path.join(tmpdir, "video.mp4")
+                if download_video(video["id"], video_path) and os.path.exists(video_path):
+                    text = extract_text_from_video(video_path, reader)
+                else:
+                    text = ""
+            summary = summarize(video["title"], text, client)
+            send_discord(video, summary)
             print(f"  전송 완료")
             time.sleep(1)
 

@@ -27,6 +27,9 @@ jobs:
           path: ~/.EasyOCR
           key: easyocr-ko-v1
 
+      - name: Install system dependencies
+        run: sudo apt-get install -y libgl1
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 

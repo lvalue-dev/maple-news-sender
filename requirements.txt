@@ -1,6 +1,7 @@
 requests>=2.32
 groq>=0.11
 yt-dlp>=2024.1
-youtube-transcript-api>=0.6
+feedparser>=6.0
+opencv-python>=4.8
 easyocr>=1.7
 Pillow>=10.0
