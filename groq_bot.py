@@ -139,6 +139,7 @@ def download_video(video_id: str, output_path: str, cookiefile: str | None) -> b
     opts = {
         **_YDL_BASE_OPTS,
         "format": "worstvideo[ext=mp4]/worst[ext=mp4]/worstvideo/worst",
+        "extractor_args": {"youtube": {"player_client": ["tv"]}},
         "outtmpl": output_path,
     }
     if cookiefile:
